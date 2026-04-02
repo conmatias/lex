@@ -60,19 +60,19 @@ Operational state includes agent sessions and heartbeats so task ownership can b
 ## Bootstrap
 
 ```bash
-python3 -m lex.cli init
+lx init
 ```
 
 ## Register Agents
 
 ```bash
-python3 -m lex.cli agent register codex-brisk-otter codex
-python3 -m lex.cli agent register claude-steady-ibis claude
+lx agent register codex-brisk-otter codex
+lx agent register claude-steady-ibis claude
 ```
 """,
     ".lex/context/active-work.md": """# Active Work
 
-Use `python3 -m lex.cli task list` to inspect live operational state.
+Use `lx task list` to inspect live operational state.
 
 This file should only capture durable summaries worth keeping in version control.
 """,

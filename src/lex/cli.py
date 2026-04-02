@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import curses
 import getpass
 import hashlib
 import json
@@ -67,6 +68,7 @@ from lex.rich_output import (
 )
 from lex.tui import run_tui
 
+CLI_COMMAND = "lx"
 
 AGENT_NAME_RE = re.compile(r"^(codex|claude|cursor|gemini|ci|automated)-[a-z]+-[a-z]+$")
 AGENT_ADJECTIVES = (
@@ -542,7 +544,7 @@ def cmd_install(args: argparse.Namespace) -> None:
         print("next steps:")
         print(f"  review {root / '.lex' / 'runtime' / 'install-merge-plan.md'}")
         print("  have the selected agent write proposals into .lex/runtime/install-merge-proposal/")
-        print("  run `lex merge diff` and then `lex merge apply` once approved")
+        print(f"  run `{CLI_COMMAND} merge diff` and then `{CLI_COMMAND} merge apply` once approved")
 
 
 def cmd_merge_plan(args: argparse.Namespace) -> None:
@@ -830,7 +832,7 @@ def cmd_session_start(args: argparse.Namespace) -> None:
     conn.commit()
     print_ok(f"started session {session_id} for {args.agent}")
     print_info(f"instance {fingerprint_label} ({fingerprint})")
-    print_info(f"bootstrap packet ready: lex session bootstrap-show {session_id}")
+    print_info(f"bootstrap packet ready: {CLI_COMMAND} session bootstrap-show {session_id}")
     if conflicting_sessions:
         other = conflicting_sessions[0]
         print_info(
@@ -2448,7 +2450,7 @@ def add_follow_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="lex")
+    parser = argparse.ArgumentParser(prog=CLI_COMMAND)
     parser.add_argument("--root", default=".", help="workspace root")
     subparsers = parser.add_subparsers(dest="command")
 
@@ -2818,7 +2820,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         if sys.stdin.isatty() and sys.stdout.isatty():
             try:
                 run_tui(root)
-            except Exception:
+            except Exception as exc:
+                if os.environ.get("LEX_DEBUG_TUI") == "1":
+                    raise
+                reason = f"{type(exc).__name__}: {exc}"
+                if isinstance(exc, curses.error):
+                    print(f"{CLI_COMMAND}: TUI unavailable, falling back to interactive shell ({reason})", file=sys.stderr)
+                else:
+                    print(f"{CLI_COMMAND}: TUI failed to start, falling back to interactive shell ({reason})", file=sys.stderr)
                 run_interactive_shell(root)
         else:
             run_interactive_shell(root)

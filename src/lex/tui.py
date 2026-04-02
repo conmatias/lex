@@ -28,26 +28,39 @@ _C_GEMINI        = 16
 def _init_colors() -> bool:
     if not curses.has_colors():
         return False
-    curses.start_color()
-    curses.use_default_colors()
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+    except curses.error:
+        return False
     bg = -1
-    curses.init_pair(_C_IN_PROGRESS,  curses.COLOR_CYAN,    bg)
-    curses.init_pair(_C_CLAIMED,      curses.COLOR_YELLOW,  bg)
-    curses.init_pair(_C_DONE,         curses.COLOR_GREEN,   bg)
-    curses.init_pair(_C_BLOCKED,      curses.COLOR_RED,     bg)
-    curses.init_pair(_C_REVIEW,       curses.COLOR_MAGENTA, bg)
-    curses.init_pair(_C_HANDOFF,      curses.COLOR_BLUE,    bg)
-    curses.init_pair(_C_DIM,          curses.COLOR_WHITE,   bg)
-    curses.init_pair(_C_CODEX,        curses.COLOR_CYAN,    bg)
-    curses.init_pair(_C_CLAUDE,       curses.COLOR_MAGENTA, bg)
-    curses.init_pair(_C_CURSOR,       curses.COLOR_YELLOW,  bg)
-    curses.init_pair(_C_HIGHLIGHT,    curses.COLOR_BLACK,   curses.COLOR_CYAN)
-    curses.init_pair(_C_HEADER,       curses.COLOR_WHITE,   bg)
-    curses.init_pair(_C_BORDER,       curses.COLOR_WHITE,   bg)
-    curses.init_pair(_C_FOCUS_BORDER, curses.COLOR_CYAN,    bg)
-    curses.init_pair(_C_STATUS_BAR,   curses.COLOR_BLACK,   curses.COLOR_WHITE)
-    curses.init_pair(_C_GEMINI,       curses.COLOR_BLUE,    bg)
+    try:
+        curses.init_pair(_C_IN_PROGRESS,  curses.COLOR_CYAN,    bg)
+        curses.init_pair(_C_CLAIMED,      curses.COLOR_YELLOW,  bg)
+        curses.init_pair(_C_DONE,         curses.COLOR_GREEN,   bg)
+        curses.init_pair(_C_BLOCKED,      curses.COLOR_RED,     bg)
+        curses.init_pair(_C_REVIEW,       curses.COLOR_MAGENTA, bg)
+        curses.init_pair(_C_HANDOFF,      curses.COLOR_BLUE,    bg)
+        curses.init_pair(_C_DIM,          curses.COLOR_WHITE,   bg)
+        curses.init_pair(_C_CODEX,        curses.COLOR_CYAN,    bg)
+        curses.init_pair(_C_CLAUDE,       curses.COLOR_MAGENTA, bg)
+        curses.init_pair(_C_CURSOR,       curses.COLOR_YELLOW,  bg)
+        curses.init_pair(_C_HIGHLIGHT,    curses.COLOR_BLACK,   curses.COLOR_CYAN)
+        curses.init_pair(_C_HEADER,       curses.COLOR_WHITE,   bg)
+        curses.init_pair(_C_BORDER,       curses.COLOR_WHITE,   bg)
+        curses.init_pair(_C_FOCUS_BORDER, curses.COLOR_CYAN,    bg)
+        curses.init_pair(_C_STATUS_BAR,   curses.COLOR_BLACK,   curses.COLOR_WHITE)
+        curses.init_pair(_C_GEMINI,       curses.COLOR_BLUE,    bg)
+    except curses.error:
+        return False
     return True
+
+
+def _safe_curs_set(visibility: int) -> None:
+    try:
+        curses.curs_set(visibility)
+    except curses.error:
+        pass
 
 
 STATUS_COLOR: dict[str, int] = {
@@ -112,7 +125,7 @@ class RexTui:
 
     def _main(self, stdscr) -> None:
         self.has_color = _init_colors()
-        curses.curs_set(0)
+        _safe_curs_set(0)
         stdscr.nodelay(False)
         stdscr.keypad(True)
         while True:
@@ -389,7 +402,7 @@ class RexTui:
         height, width = stdscr.getmaxyx()
         prompt = f"  {label}: "
         curses.echo()
-        curses.curs_set(1)
+        _safe_curs_set(1)
         status_attr = self._cp(_C_STATUS_BAR)
         stdscr.attron(status_attr)
         stdscr.hline(height - 2, 0, " ", width)
@@ -398,7 +411,7 @@ class RexTui:
         stdscr.refresh()
         value = stdscr.getstr(height - 2, len(prompt), max(width - len(prompt) - 1, 1))
         curses.noecho()
-        curses.curs_set(0)
+        _safe_curs_set(0)
         return value.decode("utf-8").strip()
 
     def _prompt_with_default(self, stdscr, label: str, default: str) -> str:

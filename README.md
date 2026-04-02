@@ -41,7 +41,7 @@ Lex turns those fuzzy coordination states into explicit system state.
 The default entrypoint is the terminal UI:
 
 ```bash
-python3 -m lex.cli
+lx
 ```
 
 That opens the main dashboard for the common workflow:
@@ -76,13 +76,13 @@ If a full terminal UI is not available, Lex falls back to a simpler interactive 
 If you want the direct command flow instead of the TUI:
 
 ```bash
-python3 -m lex.cli init
-python3 -m lex.cli agent identify codex --role dev --specialty frontend
-python3 -m lex.cli session start codex-brisk-otter --label primary
-python3 -m lex.cli task create "Define schema"
-python3 -m lex.cli task claim 1 codex-brisk-otter
-python3 -m lex.cli msg send --task 1 --from codex-brisk-otter --type note --body "Schema draft started."
-python3 -m lex.cli task show 1
+lx init
+lx agent identify codex --role dev --specialty frontend
+lx session start codex-brisk-otter --label primary
+lx task create "Define schema"
+lx task claim 1 codex-brisk-otter
+lx msg send --task 1 --from codex-brisk-otter --type note --body "Schema draft started."
+lx task show 1
 ```
 
 That gives you a local coordination loop with explicit identity, live session presence, task ownership, and durable task-scoped messaging.
@@ -94,7 +94,7 @@ That gives you a local coordination loop with explicit identity, live session pr
 Each agent gets a unique identity inside the workspace.
 
 ```bash
-python3 -m lex.cli agent identify codex
+lx agent identify codex
 ```
 
 Lex can allocate a unique name like `codex-brisk-otter` so two terminals do not accidentally reuse the same identity. You can also provide your own name with `--name`. Duplicate names are rejected.
@@ -115,8 +115,8 @@ Built-in specialties:
 To add a custom specialty for a workspace:
 
 ```bash
-python3 -m lex.cli specialty add tech_lead
-python3 -m lex.cli agent role codex-brisk-otter dev --specialty tech_lead
+lx specialty add tech_lead
+lx agent role codex-brisk-otter dev --specialty tech_lead
 ```
 
 ### Sessions
@@ -124,10 +124,10 @@ python3 -m lex.cli agent role codex-brisk-otter dev --specialty tech_lead
 Sessions make presence explicit so Lex can distinguish a live owner from a stale one.
 
 ```bash
-python3 -m lex.cli session start codex-brisk-otter --label primary
-python3 -m lex.cli session heartbeat 1
-python3 -m lex.cli session list --active-only
-python3 -m lex.cli session end 1
+lx session start codex-brisk-otter --label primary
+lx session heartbeat 1
+lx session list --active-only
+lx session end 1
 ```
 
 Each new session receives a bootstrap packet with:
@@ -144,11 +144,11 @@ Session bootstrap is mandatory before supervised work.
 Tasks can be created, claimed, inspected, and discussed through task-scoped messages.
 
 ```bash
-python3 -m lex.cli task create "Define schema"
-python3 -m lex.cli task claim 1 codex-brisk-otter
-python3 -m lex.cli msg send --task 1 --from codex-brisk-otter --type note --body "Schema draft started."
-python3 -m lex.cli task show 1
-python3 -m lex.cli msg task 1
+lx task create "Define schema"
+lx task claim 1 codex-brisk-otter
+lx msg send --task 1 --from codex-brisk-otter --type note --body "Schema draft started."
+lx task show 1
+lx msg task 1
 ```
 
 ### Delegation
@@ -156,10 +156,10 @@ python3 -m lex.cli msg task 1
 Parent tasks can delegate child work while retaining ownership of the parent.
 
 ```bash
-python3 -m lex.cli task create "Ship coordination UX" --created-by codex-brisk-otter --delegation-mode hypervisor
-python3 -m lex.cli task claim 2 codex-brisk-otter
-python3 -m lex.cli task delegate 2 codex-brisk-otter claude-steady-ibis "Review message model" --body "Inspect task messaging and suggest improvements."
-python3 -m lex.cli task show 2
+lx task create "Ship coordination UX" --created-by codex-brisk-otter --delegation-mode hypervisor
+lx task claim 2 codex-brisk-otter
+lx task delegate 2 codex-brisk-otter claude-steady-ibis "Review message model" --body "Inspect task messaging and suggest improvements."
+lx task show 2
 ```
 
 ### Watches
@@ -167,9 +167,9 @@ python3 -m lex.cli task show 2
 Subscriptions track delivery and acknowledgement state.
 
 ```bash
-python3 -m lex.cli watch add codex-brisk-otter 3
-python3 -m lex.cli watch list --agent codex-brisk-otter
-python3 -m lex.cli watch ack codex-brisk-otter 3
+lx watch add codex-brisk-otter 3
+lx watch list --agent codex-brisk-otter
+lx watch ack codex-brisk-otter 3
 ```
 
 ## Install into another project
@@ -177,7 +177,7 @@ python3 -m lex.cli watch ack codex-brisk-otter 3
 The default install flow is interactive:
 
 ```bash
-python3 -m lex.cli --root /path/to/project install
+lx --root /path/to/project install
 ```
 
 Lex detects whether the target already has `AGENTS.md`, `CLAUDE.md`, and a Git checkout, then walks through:
@@ -191,19 +191,19 @@ Lex detects whether the target already has `AGENTS.md`, `CLAUDE.md`, and a Git c
 For a new or shared project workflow, merge Lex into root agent files and keep only runtime state out of Git:
 
 ```bash
-python3 -m lex.cli --root /path/to/project install --non-interactive --agent-files merge --ignore-policy runtime --ignore-target gitignore
+lx --root /path/to/project install --non-interactive --agent-files merge --ignore-policy runtime --ignore-target gitignore
 ```
 
 For an existing project where you do not want to touch `AGENTS.md` or `CLAUDE.md`, preserve those files and install only the scaffold:
 
 ```bash
-python3 -m lex.cli --root /path/to/project install --non-interactive --agent-files preserve --ignore-policy runtime --ignore-target gitignore
+lx --root /path/to/project install --non-interactive --agent-files preserve --ignore-policy runtime --ignore-target gitignore
 ```
 
 For a local-only workflow, keep Lex out of the shared repo index by writing ignore rules to `.git/info/exclude`:
 
 ```bash
-python3 -m lex.cli --root /path/to/project install --non-interactive --agent-files merge --ignore-policy all --ignore-target local-exclude
+lx --root /path/to/project install --non-interactive --agent-files merge --ignore-policy all --ignore-target local-exclude
 ```
 
 Agent-file integration modes:
@@ -218,9 +218,9 @@ Agent-file integration modes:
 For repos with meaningful existing agent architecture:
 
 ```bash
-python3 -m lex.cli --root /path/to/project install --non-interactive --agent-files assisted --assisted-agent codex
-python3 -m lex.cli --root /path/to/project merge diff
-python3 -m lex.cli --root /path/to/project merge apply
+lx --root /path/to/project install --non-interactive --agent-files assisted --assisted-agent codex
+lx --root /path/to/project merge diff
+lx --root /path/to/project merge apply
 ```
 
 This flow writes:
@@ -236,17 +236,17 @@ An agent can prepare proposed `AGENTS.md` and `CLAUDE.md` files in the proposal 
 Use these commands to inspect current state without mutating it:
 
 ```bash
-python3 -m lex.cli task show 1
-python3 -m lex.cli msg task 1
-python3 -m lex.cli event list --task 1
+lx task show 1
+lx msg task 1
+lx event list --task 1
 ```
 
 For live coordination, the same commands support follow mode:
 
 ```bash
-python3 -m lex.cli msg inbox claude-steady-ibis --follow
-python3 -m lex.cli msg task 3 --follow
-python3 -m lex.cli event list --task 3 --follow
+lx msg inbox claude-steady-ibis --follow
+lx msg task 3 --follow
+lx event list --task 3 --follow
 ```
 
 ## Role guards
@@ -256,8 +256,8 @@ Role contracts apply to task verbs.
 For example, a `pm` session is expected to review inbox, inspect child work, and delegate before acting freely, and `task claim` is blocked unless you explicitly override the role contract:
 
 ```bash
-python3 -m lex.cli task claim 7 codex-pm-dalton
-python3 -m lex.cli task claim 7 codex-pm-dalton --force-role-override
+lx task claim 7 codex-pm-dalton
+lx task claim 7 codex-pm-dalton --force-role-override
 ```
 
 Recommended mapping:
@@ -285,21 +285,21 @@ This includes:
 Lex can supervise approved local worker processes and deliver structured task packets into worker inboxes under `.lex/runtime/workers/`.
 
 ```bash
-python3 -m lex.cli worker register codex-dev codex \
+lx worker register codex-dev codex \
   --role dev \
   --command-json '["codex"]' \
   --approval-policy always \
   --created-by codex-pm-dalton
 
-python3 -m lex.cli worker request-start codex-dev \
+lx worker request-start codex-dev \
   --requested-by codex-pm-dalton \
   --task-id 1 \
   --reason "Need a supervised dev worker for child tasks"
 
-python3 -m lex.cli worker approve 1 approved --approved-by human
-python3 -m lex.cli worker start 1
-python3 -m lex.cli worker runtime-list
-python3 -m lex.cli worker cleanup
+lx worker approve 1 approved --approved-by human
+lx worker start 1
+lx worker runtime-list
+lx worker cleanup
 ```
 
 Worker runtimes expose:
@@ -312,7 +312,7 @@ Worker runtimes expose:
 The dispatch layer writes structured task packets into the runtime inbox and tracks approval, delivery, acknowledgement, and completion state in the Lex database.
 
 ```bash
-python3 -m lex.cli dispatch create \
+lx dispatch create \
   --task-id 1 \
   --from codex-pm-dalton \
   --to-worker codex-dev \
@@ -320,10 +320,10 @@ python3 -m lex.cli dispatch create \
   --body "Read the assigned task packet and report completion back into Lex." \
   --require-approval
 
-python3 -m lex.cli dispatch approve 1 approved --approved-by human
-python3 -m lex.cli dispatch send 1 --runtime-id 1
-python3 -m lex.cli dispatch ack 1 --runtime-id 1 --note "accepted"
-python3 -m lex.cli dispatch complete 1 completed --note "merged into feature branch"
+lx dispatch approve 1 approved --approved-by human
+lx dispatch send 1 --runtime-id 1
+lx dispatch ack 1 --runtime-id 1 --note "accepted"
+lx dispatch complete 1 completed --note "merged into feature branch"
 ```
 
 ## Observability and operator visibility
