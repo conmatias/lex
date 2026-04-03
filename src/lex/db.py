@@ -552,6 +552,19 @@ def resolve_paths(root: str | Path | None = None) -> LexPaths:
     return LexPaths(root=workspace_root, lex_dir=lex_dir, db_path=lex_dir / DEFAULT_DB_NAME)
 
 
+def find_lex_root(start: Path | None = None) -> LexPaths | None:
+    """Walk up from start (or cwd) looking for a .lex directory with a database."""
+    current = (start or Path.cwd()).resolve()
+    while True:
+        candidate = current / DEFAULT_LEX_DIRNAME
+        if candidate.is_dir() and (candidate / DEFAULT_DB_NAME).exists():
+            return resolve_paths(current)
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
 def connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row

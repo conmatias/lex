@@ -62,6 +62,20 @@ def get_active_lease(conn: sqlite3.Connection, task_id: int):
     )
 
 
+def get_active_lease_for_session(conn: sqlite3.Connection, session_id: int):
+    return fetch_one(
+        conn,
+        """
+        SELECT * FROM task_leases
+        WHERE session_id = ? AND state = 'active' AND released_at IS NULL
+          AND expires_at > CURRENT_TIMESTAMP
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (session_id,),
+    )
+
+
 def get_session(conn: sqlite3.Connection, session_id: int):
     row = fetch_one(
         conn,

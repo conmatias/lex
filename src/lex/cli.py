@@ -24,6 +24,7 @@ from lex.coordination import (
     enforce_role_contract,
     get_active_bootstrap_for_agent,
     get_active_lease,
+    get_active_lease_for_session,
     get_active_session_for_agent,
     get_agent,
     get_dispatch_packet,
@@ -39,7 +40,7 @@ from lex.coordination import (
     retire_agent,
     release_stale_leases,
 )
-from lex.db import BUILTIN_SPECIALTIES, connect, derive_event_provenance, detect_path_conflicts, ensure_workspace, fetch_one, initialize_database, list_specialties, log_event, resolve_paths, run_roster_preflight
+from lex.db import BUILTIN_SPECIALTIES, connect, derive_event_provenance, detect_path_conflicts, ensure_workspace, fetch_one, find_lex_root, initialize_database, list_specialties, log_event, resolve_paths, run_roster_preflight
 from lex.dispatch import (
     VALID_WORKER_APPROVAL_POLICIES,
     command_preview,
@@ -1052,6 +1053,228 @@ def cmd_session_heartbeat(args: argparse.Namespace) -> None:
     )
     conn.commit()
     print_ok(f"heartbeat recorded for session {args.session_id}")
+
+
+# ---------------------------------------------------------------------------
+# Hook handlers — Claude Code hook integration
+# ---------------------------------------------------------------------------
+
+_HOOK_HEARTBEAT_DEBOUNCE_SECONDS = 30
+_HOOK_LEASE_RENEW_THRESHOLD = 0.25  # renew when < 25% TTL remaining
+
+
+def _hook_resolve_paths() -> tuple[str, LexPaths | None]:
+    """Return (mode, paths) where mode is 'attached', 'loose', or 'ignore'."""
+    from datetime import datetime, timezone
+
+    lex_root_env = os.environ.get("LEX_ROOT")
+    session_id_env = os.environ.get("LEX_SESSION_ID")
+
+    if session_id_env:
+        # Attached mode: explicit root or cwd
+        paths = resolve_paths(lex_root_env) if lex_root_env else find_lex_root()
+        if paths and paths.db_path.exists():
+            return "attached", paths
+        # Fall through to loose if DB not found
+
+    # Loose mode: walk up from LEX_ROOT or cwd
+    start = Path(lex_root_env).resolve() if lex_root_env else None
+    paths = find_lex_root(start)
+    if paths:
+        return "loose", paths
+
+    return "ignore", None
+
+
+def _hook_read_stdin() -> dict:
+    try:
+        raw = sys.stdin.read()
+        return json.loads(raw) if raw.strip() else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _hook_resolve_agent_id(conn: sqlite3.Connection) -> "int | None":
+    agent_name = os.environ.get("LEX_AGENT", "claude")
+    row = fetch_one(conn, "SELECT id FROM agents WHERE name = ? AND status = 'active'", (agent_name,))
+    if row:
+        return row["id"]
+    # Fallback: first active claude-kind agent
+    row = fetch_one(conn, "SELECT id FROM agents WHERE kind = 'claude' AND status = 'active' ORDER BY id LIMIT 1", ())
+    return row["id"] if row else None
+
+
+def _hook_should_heartbeat(conn: sqlite3.Connection, session_id: int) -> bool:
+    from datetime import datetime, timezone, timedelta
+
+    row = fetch_one(conn, "SELECT heartbeat_at FROM sessions WHERE id = ? AND status = 'active'", (session_id,))
+    if not row or not row["heartbeat_at"]:
+        return True
+    try:
+        last = datetime.fromisoformat(row["heartbeat_at"]).replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - last).total_seconds() >= _HOOK_HEARTBEAT_DEBOUNCE_SECONDS
+    except ValueError:
+        return True
+
+
+def _hook_write_heartbeat(conn: sqlite3.Connection, session_id: int, agent_id: int) -> None:
+    conn.execute(
+        """
+        UPDATE sessions
+        SET heartbeat_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'active' AND ended_at IS NULL
+        """,
+        (session_id,),
+    )
+    log_event(conn, "session.heartbeat", agent_id=agent_id, session_id=session_id,
+              payload={"source": "cc_hook"})
+
+
+def _hook_maybe_renew_lease(conn: sqlite3.Connection, session_id: int, agent_id: int) -> None:
+    from datetime import datetime, timezone
+
+    lease = get_active_lease_for_session(conn, session_id)
+    if not lease:
+        return
+    try:
+        acquired = datetime.fromisoformat(lease["acquired_at"]).replace(tzinfo=timezone.utc)
+        expires = datetime.fromisoformat(lease["expires_at"]).replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        total_ttl = (expires - acquired).total_seconds()
+        remaining = (expires - now).total_seconds()
+        if total_ttl <= 0 or remaining / total_ttl >= _HOOK_LEASE_RENEW_THRESHOLD:
+            return
+        # Renew to the same TTL duration
+        ttl_minutes = max(1, int(total_ttl / 60))
+        conn.execute(
+            """
+            UPDATE task_leases
+            SET heartbeat_at = CURRENT_TIMESTAMP,
+                expires_at = datetime('now', ?)
+            WHERE id = ? AND state = 'active' AND released_at IS NULL
+            """,
+            (f"+{ttl_minutes} minutes", lease["id"]),
+        )
+        log_event(conn, "lease.renewed", task_id=lease["task_id"], agent_id=agent_id,
+                  session_id=session_id, payload={"ttl_minutes": ttl_minutes, "source": "cc_hook"})
+    except (ValueError, TypeError):
+        pass
+
+
+def cmd_hook_claude_stop(args: argparse.Namespace) -> None:
+    _hook_read_stdin()  # consume stdin; payload unused for stop
+    mode, paths = _hook_resolve_paths()
+    if mode == "ignore" or paths is None:
+        return
+
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+
+    if mode == "attached":
+        try:
+            session_id = int(os.environ["LEX_SESSION_ID"])
+        except (KeyError, ValueError):
+            mode = "loose"
+        else:
+            try:
+                session = get_session(conn, session_id)
+            except SystemExit:
+                mode = "loose"
+            else:
+                if session["status"] != "active" or session["ended_at"] is not None:
+                    mode = "loose"
+                else:
+                    if _hook_should_heartbeat(conn, session_id):
+                        _hook_write_heartbeat(conn, session_id, session["agent_id"])
+                        _hook_maybe_renew_lease(conn, session_id, session["agent_id"])
+                    conn.commit()
+                    return
+
+    # Loose mode
+    agent_id = _hook_resolve_agent_id(conn)
+    log_event(conn, "claude.hook.stop", agent_id=agent_id,
+              payload={"provenance": "loose", "root": str(paths.root)})
+    conn.commit()
+
+
+def cmd_hook_claude_user_prompt_submit(args: argparse.Namespace) -> None:
+    _hook_read_stdin()
+    mode, paths = _hook_resolve_paths()
+    if mode == "ignore" or paths is None:
+        return
+
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+
+    if mode == "attached":
+        try:
+            session_id = int(os.environ["LEX_SESSION_ID"])
+        except (KeyError, ValueError):
+            mode = "loose"
+        else:
+            try:
+                session = get_session(conn, session_id)
+            except SystemExit:
+                mode = "loose"
+            else:
+                if session["status"] != "active" or session["ended_at"] is not None:
+                    mode = "loose"
+                else:
+                    if _hook_should_heartbeat(conn, session_id):
+                        _hook_write_heartbeat(conn, session_id, session["agent_id"])
+                    conn.commit()
+                    return
+
+    # Loose mode
+    agent_id = _hook_resolve_agent_id(conn)
+    log_event(conn, "claude.hook.user_prompt_submit", agent_id=agent_id,
+              payload={"provenance": "loose", "root": str(paths.root)})
+    conn.commit()
+
+
+def cmd_hook_claude_post_tool_use(args: argparse.Namespace) -> None:
+    payload = _hook_read_stdin()
+    tool_name = payload.get("tool_name", "")
+    tool_input = payload.get("tool_input", {})
+    file_path = tool_input.get("file_path") or tool_input.get("path", "")
+
+    mode, paths = _hook_resolve_paths()
+    if mode == "ignore" or paths is None:
+        return
+
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+
+    event_payload: dict = {"tool": tool_name, "file": file_path}
+
+    if mode == "attached":
+        try:
+            session_id = int(os.environ["LEX_SESSION_ID"])
+        except (KeyError, ValueError):
+            mode = "loose"
+        else:
+            try:
+                session = get_session(conn, session_id)
+            except SystemExit:
+                mode = "loose"
+            else:
+                if session["status"] != "active" or session["ended_at"] is not None:
+                    mode = "loose"
+                else:
+                    task_id_env = os.environ.get("LEX_TASK_ID")
+                    task_id = int(task_id_env) if task_id_env and task_id_env.isdigit() else None
+                    event_payload["provenance"] = "attached"
+                    log_event(conn, "claude.hook.post_tool_use", agent_id=session["agent_id"],
+                              session_id=session_id, task_id=task_id, payload=event_payload)
+                    conn.commit()
+                    return
+
+    # Loose mode
+    agent_id = _hook_resolve_agent_id(conn)
+    event_payload["provenance"] = "loose"
+    event_payload["root"] = str(paths.root)
+    log_event(conn, "claude.hook.post_tool_use", agent_id=agent_id, payload=event_payload)
+    conn.commit()
 
 
 def cmd_session_end(args: argparse.Namespace) -> None:
@@ -2808,6 +3031,21 @@ def build_parser() -> argparse.ArgumentParser:
     event_list.add_argument("--json", action="store_true")
     add_follow_arguments(event_list)
     event_list.set_defaults(func=cmd_event_list)
+
+    hook_parser = subparsers.add_parser("hook")
+    hook_sub = hook_parser.add_subparsers(dest="hook_command", required=True)
+
+    claude_parser = hook_sub.add_parser("claude")
+    claude_sub = claude_parser.add_subparsers(dest="claude_hook_command", required=True)
+
+    claude_stop = claude_sub.add_parser("stop")
+    claude_stop.set_defaults(func=cmd_hook_claude_stop)
+
+    claude_upr = claude_sub.add_parser("user-prompt-submit")
+    claude_upr.set_defaults(func=cmd_hook_claude_user_prompt_submit)
+
+    claude_ptu = claude_sub.add_parser("post-tool-use")
+    claude_ptu.set_defaults(func=cmd_hook_claude_post_tool_use)
 
     return parser
 
