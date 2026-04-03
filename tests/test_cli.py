@@ -1,6 +1,6 @@
 from argparse import Namespace
 
-from lex.cli import AGENT_NAME_RE, allocate_agent_name, build_session_fingerprint, cmd_agent_identify, normalize_agent_role, resolve_install_options
+from lex.cli import AGENT_NAME_RE, allocate_agent_name, build_session_fingerprint, cmd_agent_identify, main, normalize_agent_role, resolve_install_options
 from lex.dashboard import load_dashboard_state
 from lex.db import connect, ensure_workspace, initialize_database
 from lex.installer import InstallContext, install_scaffold
@@ -63,8 +63,6 @@ def test_agent_role_command_updates_role(tmp_path):
     conn.execute("INSERT INTO agents (name, kind, role, specialty, status) VALUES ('codex-brisk-otter', 'codex', '', '', 'active')")
     conn.commit()
 
-    from lex.cli import main
-
     main(["--root", str(tmp_path), "agent", "role", "codex-brisk-otter", "auditor", "--specialty", "security"])
 
     row = conn.execute("SELECT role, specialty FROM agents WHERE name = 'codex-brisk-otter'").fetchone()
@@ -100,8 +98,6 @@ def test_agent_identify_rejects_unknown_specialty_until_added(tmp_path):
 
 
 def test_custom_specialty_can_be_added_then_used(tmp_path):
-    from lex.cli import main
-
     main(["--root", str(tmp_path), "specialty", "add", "mobile"])
     cmd_agent_identify(
         Namespace(
@@ -120,6 +116,19 @@ def test_custom_specialty_can_be_added_then_used(tmp_path):
     row = conn.execute("SELECT role, specialty FROM agents").fetchone()
     assert row["role"] == "dev"
     assert row["specialty"] == "mobile"
+
+
+def test_dx_command_dispatches_to_dx_runner(tmp_path, monkeypatch):
+    called = {}
+
+    def fake_run_dx(root):
+        called["root"] = root
+
+    monkeypatch.setattr("lex.cli.run_dx", fake_run_dx)
+
+    main(["--root", str(tmp_path), "dx"])
+
+    assert called["root"] == tmp_path.resolve()
 
 
 def test_build_session_fingerprint_returns_hash_and_label():

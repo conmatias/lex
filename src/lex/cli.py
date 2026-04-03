@@ -40,6 +40,7 @@ from lex.coordination import (
     retire_agent,
     release_stale_leases,
 )
+from lex.dx import run_dx
 from lex.db import BUILTIN_SPECIALTIES, connect, derive_event_provenance, detect_path_conflicts, ensure_workspace, fetch_one, find_lex_root, initialize_database, list_specialties, log_event, resolve_paths, run_roster_preflight
 from lex.dispatch import (
     VALID_WORKER_APPROVAL_POLICIES,
@@ -2665,6 +2666,10 @@ def cmd_event_list(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_dx(args: argparse.Namespace) -> None:
+    run_dx(Path(args.root).resolve())
+
+
 def add_follow_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--since-id", type=int)
     parser.add_argument("--follow", action="store_true")
@@ -3031,6 +3036,9 @@ def build_parser() -> argparse.ArgumentParser:
     event_list.add_argument("--json", action="store_true")
     add_follow_arguments(event_list)
     event_list.set_defaults(func=cmd_event_list)
+
+    dx_parser = subparsers.add_parser("dx")
+    dx_parser.set_defaults(func=cmd_dx)
 
     hook_parser = subparsers.add_parser("hook")
     hook_sub = hook_parser.add_subparsers(dest="hook_command", required=True)

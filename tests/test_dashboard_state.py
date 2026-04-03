@@ -248,3 +248,44 @@ def test_dashboard_summary_counts_operator_attention_signals(tmp_path):
     assert state.summary["dirty_sessions"] == 1
     assert state.summary["sessions_needing_attention"] == 1
     assert state.summary["risky_tasks"] == 3
+
+
+def test_dashboard_state_includes_dx_roster_and_git_context(tmp_path):
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+
+    conn.execute("INSERT INTO agents (name, kind, role, status) VALUES ('dx-agent', 'codex', 'dev', 'active')")
+    conn.execute(
+        """
+        INSERT INTO sessions (agent_id, label, status, git_branch, git_base_ref, git_changed_files_json)
+        VALUES (1, 'primary', 'active', 'main', 'origin/main', '["file1.py", "file2.py"]')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO tasks (title, status, owner_agent_id, claimed_paths_json)
+        VALUES ('dx task', 'in_progress', 1, '["src/"]')
+        """
+    )
+    conn.commit()
+
+    state = load_dashboard_state(tmp_path)
+
+    assert len(state.dx_roster) == 1
+    roster = state.dx_roster[0]
+    assert roster["agent_name"] == "dx-agent"
+    assert roster["task_title"] == "dx task"
+    assert roster["claimed_path_count"] == 1
+    assert roster["changed_file_count"] == 2
+
+    session = state.sessions[0]
+    assert session["git_branch"] == "main"
+    assert session["git_base_ref"] == "origin/main"
+    assert session["git_changed_files_json"] == '["file1.py", "file2.py"]'
+
+    task = state.tasks[0]
+    assert task["claimed_paths_json"] == '["src/"]'
+
+    detail = state.task_details[1]
+    assert detail["claimed_paths_json"] == '["src/"]'

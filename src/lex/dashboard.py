@@ -17,6 +17,7 @@ class DashboardState:
     inbox: list[dict]
     events: list[dict]
     task_details: dict[int, dict]
+    dx_roster: list[dict]
 
 
 def load_dashboard_state(root: Path) -> DashboardState:
@@ -32,6 +33,7 @@ def load_dashboard_state(root: Path) -> DashboardState:
         inbox=_query_inbox(conn),
         events=_query_events(conn),
         task_details=_query_task_details(conn),
+        dx_roster=_query_dx_roster(conn),
     )
 
 
@@ -181,6 +183,11 @@ def _query_sessions(conn: sqlite3.Connection) -> list[dict]:
             s.fingerprint_label,
             s.status,
             s.cwd,
+            s.git_branch,
+            s.git_base_ref,
+            s.git_dirty,
+            s.git_changed_files_json,
+            s.git_staged_files_json,
             s.started_at,
             s.heartbeat_at,
             CASE
@@ -233,6 +240,7 @@ def _query_tasks(conn: sqlite3.Connection) -> list[dict]:
             t.priority,
             t.delegation_mode,
             t.parent_task_id,
+            t.claimed_paths_json,
             a.name AS owner_name,
             a.kind AS owner_kind,
             a.role AS owner_role,
@@ -328,6 +336,7 @@ def _query_task_details(conn: sqlite3.Connection) -> dict[int, dict]:
             t.priority,
             t.delegation_mode,
             t.parent_task_id,
+            t.claimed_paths_json,
             a.name AS owner_name,
             a.kind AS owner_kind,
             a.role AS owner_role,
@@ -396,3 +405,33 @@ def _query_task_details(conn: sqlite3.Connection) -> dict[int, dict]:
             "children": list(reversed(children)),
         }
     return details
+
+
+def _query_dx_roster(conn: sqlite3.Connection) -> list[dict]:
+    return _rows(
+        conn,
+        """
+        SELECT
+            a.id AS agent_id,
+            a.name AS agent_name,
+            a.kind AS agent_kind,
+            a.role AS agent_role,
+            a.specialty AS agent_specialty,
+            s.id AS session_id,
+            CASE
+                WHEN s.heartbeat_at < datetime('now', '-15 minutes') THEN 1
+                ELSE 0
+            END AS is_stale,
+            t.id AS task_id,
+            t.title AS task_title,
+            t.status AS task_status,
+            json_array_length(t.claimed_paths_json) AS claimed_path_count,
+            json_array_length(s.git_changed_files_json) AS changed_file_count,
+            s.heartbeat_at AS last_activity_at
+        FROM agents a
+        LEFT JOIN sessions s ON s.agent_id = a.id AND s.status = 'active' AND s.ended_at IS NULL
+        LEFT JOIN tasks t ON t.owner_agent_id = a.id AND t.status IN ('claimed', 'in_progress', 'blocked', 'review_requested', 'handoff_pending')
+        WHERE a.status = 'active'
+        ORDER BY a.name
+        """,
+    )
