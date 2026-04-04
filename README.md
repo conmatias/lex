@@ -44,6 +44,18 @@ The default entrypoint is the terminal UI:
 lx
 ```
 
+The standalone supervision UI is a separate surface:
+
+```bash
+dx
+```
+
+In a dev checkout where the console script may not be installed yet, the guaranteed invocation path is:
+
+```bash
+python3 -m lex.dx
+```
+
 That opens the main dashboard for the common workflow:
 
 * install Lex into a repo

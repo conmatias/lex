@@ -1,9 +1,10 @@
 import json
 import subprocess
+import tomllib
 
 from lex.dashboard import load_dashboard_state
 from lex.db import connect, ensure_workspace, initialize_database
-from lex.dx.app import build_diff, build_dx_view
+from lex.dx.app import build_diff, build_dx_view, main
 
 
 def _setup_agent(conn, *, name="codex-brisk-otter", kind="codex", role="dev"):
@@ -86,3 +87,35 @@ def test_build_diff_uses_git_base_ref(tmp_path):
 
     assert "diff --git" in diff
     assert "+change" in diff
+
+
+def test_dx_pyproject_exposes_console_script():
+    with open("pyproject.toml", "rb") as handle:
+        data = tomllib.load(handle)
+
+    assert data["project"]["scripts"]["dx"] == "lex.dx.app:main"
+
+
+def test_dx_main_dispatches_to_runner(tmp_path, monkeypatch):
+    called = {}
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    def fake_run_dx(root):
+        called["root"] = root
+
+    monkeypatch.setattr("lex.dx.app.run_dx", fake_run_dx)
+
+    main(["--root", str(tmp_path)])
+
+    assert called["root"] == tmp_path.resolve()
+
+
+def test_dx_main_requires_interactive_tty(tmp_path):
+    try:
+        main(["--root", str(tmp_path)])
+    except SystemExit as exc:
+        assert "interactive terminal" in str(exc)
+    else:
+        raise AssertionError("expected dx main to reject non-interactive invocation")

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import curses
 import json
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -346,3 +348,18 @@ class DxTui:
 
 def run_dx(root: Path) -> None:
     DxTui(root).run()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="dx")
+    parser.add_argument("--root", default=".", help="workspace root")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    root = Path(args.root).resolve()
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise SystemExit("dx requires an interactive terminal; use `python -m lex.dx` or the installed `dx` script from a real TTY")
+    run_dx(root)

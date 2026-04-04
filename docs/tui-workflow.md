@@ -3,10 +3,22 @@
 The preferred entrypoint for day-to-day use is:
 
 ```bash
-python3 -m lex.cli
+lx
 ```
 
 When a real terminal is available, this launches the lex TUI. Otherwise lex falls back to the simpler menu shell.
+
+For the standalone dx surface, use:
+
+```bash
+dx
+```
+
+If the standalone script is not installed in the current dev checkout yet, use:
+
+```bash
+python3 -m lex.dx
+```
 
 ## Core Navigation
 

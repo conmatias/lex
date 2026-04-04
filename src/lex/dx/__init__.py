@@ -1,3 +1,3 @@
-from lex.dx.app import run_dx
+from lex.dx.app import main, run_dx
 
-__all__ = ["run_dx"]
+__all__ = ["main", "run_dx"]
