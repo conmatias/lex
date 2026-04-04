@@ -5,11 +5,13 @@ import json
 import os
 import sqlite3
 import subprocess
+import threading
 import time
 from pathlib import Path
 
 from lex.db import connect, initialize_database, resolve_paths
 from lex.dispatch import worker_runtime_dir
+from lex.discovery import LexDiscovery
 
 
 def _load_runtime(conn: sqlite3.Connection, runtime_id: int) -> sqlite3.Row:
@@ -111,33 +113,61 @@ def main(argv: list[str] | None = None) -> None:
     )
     conn.commit()
 
-    with stdout_path.open("ab") as stdout_handle, stderr_path.open("ab") as stderr_handle:
-        child = subprocess.Popen(
-            command,
-            cwd=cwd,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=stdout_handle,
-            stderr=stderr_handle,
-            start_new_session=True,
-            close_fds=True,
-        )
-        conn.execute(
-            "UPDATE worker_runtimes SET child_pid = ?, heartbeat_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (child.pid, args.runtime_id),
-        )
-        conn.commit()
+    # Start background discovery announcement if there is an active session for the agent
+    discovery = None
+    session = conn.execute(
+        """
+        SELECT s.id, a.name AS agent_name, s.git_branch, s.git_base_ref
+        FROM sessions s
+        JOIN agents a ON a.id = s.agent_id
+        JOIN worker_runtimes wr ON wr.requested_by_agent_id = a.id
+        WHERE wr.id = ? AND s.status = 'active' AND s.ended_at IS NULL
+        ORDER BY s.id DESC LIMIT 1
+        """,
+        (args.runtime_id,),
+    ).fetchone()
 
-        exit_code: int | None = None
-        while exit_code is None:
-            exit_code = child.poll()
+    if session:
+        discovery = LexDiscovery({
+            "agent_name": session["agent_name"],
+            "session_id": session["id"],
+            "git_branch": session["git_branch"],
+            "git_base_ref": session["git_base_ref"],
+            "root_path": str(paths.root)
+        })
+        discovery.start_announcing()
+
+    with stdout_path.open("ab") as stdout_handle, stderr_path.open("ab") as stderr_handle:
+        try:
+            child = subprocess.Popen(
+                command,
+                cwd=cwd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                start_new_session=True,
+                close_fds=True,
+            )
             conn.execute(
-                "UPDATE worker_runtimes SET heartbeat_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (args.runtime_id,),
+                "UPDATE worker_runtimes SET child_pid = ?, heartbeat_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (child.pid, args.runtime_id),
             )
             conn.commit()
-            if exit_code is None:
-                time.sleep(1.0)
+
+            exit_code: int | None = None
+            while exit_code is None:
+                exit_code = child.poll()
+                conn.execute(
+                    "UPDATE worker_runtimes SET heartbeat_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (args.runtime_id,),
+                )
+                conn.commit()
+                if exit_code is None:
+                    time.sleep(1.0)
+        finally:
+            if discovery:
+                discovery.stop()
 
     final_status = "exited" if exit_code == 0 else "failed"
     _update_runtime(conn, args.runtime_id, status=final_status, exit_code=exit_code, ended=True)

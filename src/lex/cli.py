@@ -41,6 +41,7 @@ from lex.coordination import (
     release_stale_leases,
 )
 from lex.dx import run_dx
+from lex.discovery import LexDiscovery
 from lex.db import BUILTIN_SPECIALTIES, connect, derive_event_provenance, detect_path_conflicts, ensure_workspace, fetch_one, find_lex_root, initialize_database, list_specialties, log_event, resolve_paths, run_roster_preflight
 from lex.dispatch import (
     VALID_WORKER_APPROVAL_POLICIES,
@@ -2666,8 +2667,96 @@ def cmd_event_list(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_discover(args: argparse.Namespace) -> None:
+    print_info("listening for nearby Lex peers...")
+    discovery = LexDiscovery()
+    
+    peers = []
+    def on_peer(peer):
+        print(f"  found peer: {peer.agent_name:<20} | branch: {peer.git_branch or '-':<15} | root: {peer.root_path}")
+        peers.append(peer)
+
+    discovery.listen(timeout=args.timeout, callback=on_peer)
+    
+    if not peers:
+        print("no peers discovered")
+
+
+def cmd_discovery_announce(args: argparse.Namespace) -> None:
+    paths = resolve_paths(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    
+    # Try to find an active session to announce
+    session = None
+    if args.session_id:
+        session = get_session(conn, args.session_id)
+    else:
+        # Just pick the most recent active session
+        session = conn.execute(
+            """
+            SELECT s.id, a.name AS agent_name, s.git_branch, s.git_base_ref
+            FROM sessions s
+            JOIN agents a ON a.id = s.agent_id
+            WHERE s.status = 'active' AND s.ended_at IS NULL
+            ORDER BY s.id DESC LIMIT 1
+            """
+        ).fetchone()
+    
+    if not session:
+        print_info("no active session found to announce, announcing as generic peer")
+        payload = {
+            "agent_name": "anonymous",
+            "root_path": str(paths.root)
+        }
+    else:
+        payload = {
+            "agent_name": session["agent_name"],
+            "session_id": session["id"],
+            "git_branch": session["git_branch"],
+            "git_base_ref": session["git_base_ref"],
+            "root_path": str(paths.root)
+        }
+    
+    print_ok(f"announcing as {payload['agent_name']} (press Ctrl+C to stop)")
+    discovery = LexDiscovery(payload)
+    discovery.start_announcing(interval=args.interval)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nstopped announcement")
+
+
 def cmd_dx(args: argparse.Namespace) -> None:
-    run_dx(Path(args.root).resolve())
+    root = Path(args.root).resolve()
+    paths = resolve_paths(root)
+
+    # Optionally announce this dx session on the LAN if a workspace DB exists.
+    discovery = None
+    if paths.db_path.exists():
+        conn = connect(paths.db_path)
+        session = conn.execute(
+            "SELECT s.id, a.name AS agent_name, s.git_branch, s.git_base_ref "
+            "FROM sessions s JOIN agents a ON a.id = s.agent_id "
+            "WHERE s.status = 'active' AND s.ended_at IS NULL "
+            "ORDER BY s.id DESC LIMIT 1"
+        ).fetchone()
+        if session:
+            discovery = LexDiscovery({
+                "agent_name": session["agent_name"],
+                "session_id": session["id"],
+                "git_branch": session["git_branch"],
+                "git_base_ref": session["git_base_ref"],
+                "root_path": str(root),
+            })
+            discovery.start_announcing()
+
+    try:
+        run_dx(root)
+    finally:
+        if discovery:
+            discovery.stop()
 
 
 def add_follow_arguments(parser: argparse.ArgumentParser) -> None:
@@ -2684,6 +2773,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     init_parser = subparsers.add_parser("init")
     init_parser.set_defaults(func=cmd_init)
+
+    discovery_parser = subparsers.add_parser("discovery")
+    discovery_sub = discovery_parser.add_subparsers(dest="discovery_command", required=True)
+    
+    discovery_list = discovery_sub.add_parser("list")
+    discovery_list.add_argument("--timeout", type=float, default=2.0)
+    discovery_list.set_defaults(func=cmd_discover)
+    
+    discovery_announce = discovery_sub.add_parser("announce")
+    discovery_announce.add_argument("--session-id", type=int)
+    discovery_announce.add_argument("--interval", type=int, default=5)
+    discovery_announce.set_defaults(func=cmd_discovery_announce)
 
     install_parser = subparsers.add_parser("install")
     install_parser.add_argument("--agent-files", choices=["preserve", "merge", "assisted", "overwrite"], default="merge")
