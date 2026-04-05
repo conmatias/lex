@@ -17,6 +17,20 @@ from typing import Any
 
 import pyte
 
+class DxScreen(pyte.Screen):
+    """Compat wrapper around pyte.Screen for parser/API mismatches.
+
+    Some pyte releases route certain CSI sequences through handlers with a
+    ``private=...`` keyword even when the base Screen method only accepts
+    positional parameters. Accept and ignore that flag so a malformed or
+    nonstandard sequence cannot crash the PTY reader thread.
+    """
+
+    def select_graphic_rendition(self, *attrs: int, private: bool = False) -> None:
+        del private
+        return super().select_graphic_rendition(*attrs)
+
+
 # Matches: OSC sequences (ESC ] ... BEL), CSI sequences (ESC [ ... letter),
 # and 2-char Fe sequences (ESC @-_).  OSC must come before the Fe catch-all
 # because ']' (0x5D) falls inside the [@-_] range.  Used to strip VT/ANSI
@@ -153,7 +167,7 @@ class PTYManager:
         # Attach a pyte VT screen buffer. All VT control sequences (cursor
         # movement, in-place rewrites, color) are handled here so screen_lines()
         # always returns the current rendered state of the terminal.
-        screen = pyte.Screen(cols, rows)
+        screen = DxScreen(cols, rows)
         stream = pyte.ByteStream(screen)
         session._screen = screen  # type: ignore[attr-defined]
         session._stream = stream  # type: ignore[attr-defined]

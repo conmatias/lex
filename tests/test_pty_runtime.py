@@ -504,6 +504,18 @@ class TestVTScreenBuffer:
             assert "\x1b" not in line, f"escape found in: {line!r}"
         assert any("green text" in line for line in lines)
 
+    def test_dx_screen_tolerates_private_sgr_kwarg(self):
+        from lex.dx.pty_runtime import DxScreen
+
+        screen = DxScreen(40, 3)
+
+        # Mirrors the crash path from pyte's CSI dispatcher when it passes
+        # private=True into SGR handling.
+        screen.select_graphic_rendition(32, private=True)
+
+        lines = [line.rstrip() for line in screen.display]
+        assert len(lines) == 3
+
     def test_scrollback_log_accumulates_across_screen_redraws(self, mgr):
         """session.output scrollback should accumulate even as screen overwrites."""
         sid = mgr.spawn("shell", "cat")
