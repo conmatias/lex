@@ -125,6 +125,29 @@ def test_build_shell_summaries_includes_runtime_sessions(tmp_path):
     assert runtime_summary.output_tail[-1] == "tests passed"
 
 
+def test_build_shell_summaries_prioritizes_runtime_before_agent(tmp_path):
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    agent_id = _setup_agent(conn)
+    _setup_session(conn, agent_id, tmp_path)
+    _setup_task(conn, agent_id)
+    conn.commit()
+    runtime = TerminalSession(
+        id=7,
+        title="shell-7",
+        kind="shell",
+        cwd=tmp_path,
+        pid=4321,
+        status="running",
+        output=["boot"],
+    )
+
+    summaries = build_shell_summaries(tmp_path, terminal_sessions=[runtime])
+
+    assert [summary.id for summary in summaries[:2]] == ["shell-7", "codex-brisk-otter"]
+
+
 def test_shell_submit_prompt_updates_routing_target_and_status(tmp_path):
     paths = ensure_workspace(tmp_path)
     conn = connect(paths.db_path)
@@ -192,6 +215,28 @@ def test_shell_expanded_lines_render_runtime_output_and_actions(tmp_path):
     shell.stop()
 
 
+def test_feed_layout_makes_runtime_slice_dominant(tmp_path):
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    agent_id = _setup_agent(conn)
+    _setup_session(conn, agent_id, tmp_path)
+    _setup_task(conn, agent_id)
+    conn.commit()
+    manager = FakePTYManager()
+
+    shell = DxShell(tmp_path, pty_manager=manager, runtime_command_builder=lambda kind: f"run-{kind}")
+    shell.submit_prompt("/spawn shell")
+
+    layout = shell.feed_layout(available_rows=20)
+
+    assert layout.dominant is not None
+    assert layout.dominant.id == "shell-1"
+    assert layout.dominant_height >= 14
+    assert all(summary.id != "shell-1" for summary in layout.summaries)
+    shell.stop()
+
+
 def test_shell_toggle_expand_marks_summary(tmp_path):
     paths = ensure_workspace(tmp_path)
     conn = connect(paths.db_path)
@@ -206,4 +251,84 @@ def test_shell_toggle_expand_marks_summary(tmp_path):
 
     assert shell.controller.state.expanded_slice_id == "codex-brisk-otter"
     assert shell.focused_summary() is not None
+    shell.stop()
+
+
+# ---------------------------------------------------------------------------
+# Task #37 — _default_runtime_command binary detection + _spawn_runtime errors
+# ---------------------------------------------------------------------------
+
+def test_default_runtime_command_shell_returns_shell_binary(tmp_path):
+    """Shell kind returns the $SHELL env var (or bash fallback)."""
+    import os
+    from lex.dx.shell import _default_runtime_command
+
+    shell_bin = os.environ.get("SHELL", "bash")
+    assert _default_runtime_command("shell") == shell_bin
+
+
+def test_default_runtime_command_known_binary_found(tmp_path, monkeypatch):
+    """When shutil.which() returns a path, that path is returned."""
+    import shutil
+    from lex.dx.shell import _default_runtime_command
+
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/local/bin/{name}")
+    assert _default_runtime_command("claude") == "/usr/local/bin/claude"
+    assert _default_runtime_command("codex") == "/usr/local/bin/codex"
+    assert _default_runtime_command("gemini") == "/usr/local/bin/gemini"
+
+
+def test_default_runtime_command_missing_binary_raises(tmp_path, monkeypatch):
+    """When shutil.which() returns None, RuntimeError is raised."""
+    import shutil
+    import pytest
+    from lex.dx.shell import _default_runtime_command
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    with pytest.raises(RuntimeError, match="not found in PATH"):
+        _default_runtime_command("claude")
+
+
+def test_spawn_runtime_missing_binary_sets_status(tmp_path, monkeypatch):
+    """If the command builder raises RuntimeError, status is set and no exception propagates."""
+    import shutil
+    from lex.db import connect, ensure_workspace, initialize_database
+
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    manager = FakePTYManager()
+    shell = DxShell(tmp_path, pty_manager=manager)
+
+    result = shell.submit_prompt("/spawn claude")
+
+    assert "claude" in shell.status.lower() or "not found" in shell.status.lower() or "cannot spawn" in shell.status.lower()
+    # No runtime session should have been created
+    assert not any(s.kind == "claude" for s in manager.list_sessions())
+    shell.stop()
+
+
+def test_spawn_runtime_spawn_failure_sets_status(tmp_path):
+    """If PTYManager.spawn() raises, status is set and no exception propagates."""
+    from lex.db import connect, ensure_workspace, initialize_database
+
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+
+    class FailingPTYManager(FakePTYManager):
+        def spawn(self, kind, cmd, **kwargs):
+            raise OSError("pty allocation failed")
+
+    manager = FailingPTYManager()
+    shell = DxShell(
+        tmp_path,
+        pty_manager=manager,
+        runtime_command_builder=lambda kind: f"/bin/{kind}",
+    )
+    result = shell.submit_prompt("/spawn shell")
+
+    assert "spawn failed" in shell.status or "failed" in shell.status
     shell.stop()

@@ -77,6 +77,13 @@ def build_shell_summaries(
     return summaries
 
 
+@dataclass(frozen=True)
+class FeedLayout:
+    dominant: SliceSummary | None
+    summaries: tuple[SliceSummary, ...]
+    dominant_height: int
+
+
 class DxShell:
     def __init__(
         self,
@@ -200,12 +207,21 @@ class DxShell:
 
     def _spawn_runtime(self, kind: str) -> None:
         manager = self._ensure_pty_manager()
-        session_id = manager.spawn(
-            kind,
-            self._runtime_command_builder(kind),
-            cwd=self.root,
-            lex_root=self.root,
-        )
+        try:
+            cmd = self._runtime_command_builder(kind)
+        except RuntimeError as exc:
+            self.status = str(exc)
+            return
+        try:
+            session_id = manager.spawn(
+                kind,
+                cmd,
+                cwd=self.root,
+                lex_root=self.root,
+            )
+        except Exception as exc:
+            self.status = f"spawn failed: {exc}"
+            return
         session = manager.get_session(session_id)
         if session is None:
             self.status = f"failed to spawn {kind}"
@@ -268,6 +284,27 @@ class DxShell:
             actions = "[y] approve  [n] deny  [m] prompt  [space] collapse"
         lines.append(actions)
         return lines[:max_lines]
+
+    def active_runtime_summary(self) -> SliceSummary | None:
+        expanded_id = self.controller.state.expanded_slice_id
+        if expanded_id:
+            expanded = next((summary for summary in self.summaries if summary.id == expanded_id), None)
+            if expanded and expanded.source == "runtime":
+                return expanded
+        focused = self.focused_summary()
+        if focused and focused.source == "runtime":
+            return focused
+        return next((summary for summary in self.summaries if summary.source == "runtime"), None)
+
+    def feed_layout(self, *, available_rows: int) -> FeedLayout:
+        dominant = self.active_runtime_summary()
+        summaries = [summary for summary in self.summaries if dominant is None or summary.id != dominant.id]
+        if dominant is None or available_rows <= 3:
+            return FeedLayout(dominant=None, summaries=tuple(self.summaries), dominant_height=0)
+        dominant_height = max(int(available_rows * 0.75), min(available_rows - 2, 8))
+        dominant_height = min(dominant_height, max(available_rows - len(summaries), 4))
+        dominant_height = max(dominant_height, min(available_rows, 4))
+        return FeedLayout(dominant=dominant, summaries=tuple(summaries), dominant_height=dominant_height)
 
     def drawer_lines(self, *, height: int) -> list[str]:
         view = self.controller.state.drawer_view or "help"
@@ -433,24 +470,38 @@ class DxShell:
         if not self.summaries:
             stdscr.addnstr(2, 2, "No active slices", width - 4)
         else:
+            layout = self.feed_layout(available_rows=max(feed_bottom - 1, 0))
             row = 2
-            for idx, summary in enumerate(self.summaries):
+            if layout.dominant is not None and row <= feed_bottom:
+                dominant = layout.dominant
+                focused = self.focused_summary()
+                dominant_focus = focused is not None and focused.id == dominant.id and self.keyboard_focus == "feed"
+                prefix = "▶" if dominant_focus else " "
+                line = f"{prefix} ▼ {dominant.title} [{dominant.state}]  {dominant.task_label}  {dominant.detail}"
+                attr = curses.A_BOLD if dominant_focus else curses.A_NORMAL
+                stdscr.addnstr(row, 1, line, width - 2, attr)
+                row += 1
+                dominant_lines = self.expanded_lines(dominant, max_lines=max(layout.dominant_height - 1, 1))
+                for line in dominant_lines:
+                    if row > feed_bottom:
+                        break
+                    stdscr.addnstr(row, 4, line, width - 6)
+                    row += 1
+                if row <= feed_bottom:
+                    stdscr.hline(row, 1, "-", max(width - 2, 1))
+                    row += 1
+            visible_summaries = layout.summaries if layout.dominant is not None else tuple(self.summaries)
+            for summary in visible_summaries:
                 if row > feed_bottom:
                     break
+                idx = next((index for index, candidate in enumerate(self.summaries) if candidate.id == summary.id), 0)
                 focused = idx == self.focus_index and self.keyboard_focus == "feed"
                 prefix = "▶" if focused else " "
-                marker = "▼" if summary.expanded else _state_icon(summary)
+                marker = _state_icon(summary)
                 line = f"{prefix} {marker} {summary.title} [{summary.state}]  {summary.task_label}  {summary.detail}"
                 attr = curses.A_BOLD if focused else curses.A_NORMAL
                 stdscr.addnstr(row, 1, line, width - 2, attr)
                 row += 1
-                if summary.expanded:
-                    available = max(feed_bottom - row + 1, 0)
-                    for line in self.expanded_lines(summary, max_lines=available):
-                        if row > feed_bottom:
-                            break
-                        stdscr.addnstr(row, 4, line, width - 6)
-                        row += 1
 
         if self.controller.state.drawer_open:
             drawer_top = prompt_row - drawer_height
@@ -497,15 +548,16 @@ def _slice_sort_key(summary: SliceSummary) -> tuple[int, str]:
         "attention": 0,
         "review": 0,
         "permission": 0,
-        "active": 1,
         "running": 1,
+        "active": 1,
         "waiting": 2,
         "blocked": 3,
         "idle": 4,
         "stale": 5,
         "exited": 6,
     }
-    return (priority.get(summary.state, 3), summary.title)
+    source_bias = 0 if summary.source == "runtime" else 1
+    return (priority.get(summary.state, 3), source_bias, summary.title)
 
 
 def _state_icon(summary: SliceSummary) -> str:
@@ -523,6 +575,16 @@ def _state_icon(summary: SliceSummary) -> str:
 
 
 def _default_runtime_command(kind: str) -> str:
+    import shutil
+
     if kind == "shell":
         return os.environ.get("SHELL", "bash")
-    return f"python3 -c \"print('dx {kind} slice ready'); import time; time.sleep(600)\""
+
+    # For agent kinds, require the real binary — no sleep placeholders.
+    binary = shutil.which(kind)
+    if binary is None:
+        raise RuntimeError(
+            f"Cannot spawn '{kind}' runtime: '{kind}' binary not found in PATH. "
+            f"Install it or pass a custom runtime_command_builder to DxShell."
+        )
+    return binary
