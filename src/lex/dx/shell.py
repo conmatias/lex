@@ -70,7 +70,7 @@ def build_shell_summaries(
                 runtime_session_id=session.id,
                 attention_flag=session.attention_flag,
                 unread_count=session.unread_count,
-                output_tail=tuple(session.output[-5:]),
+                output_tail=tuple(session.output[-200:]),
             )
         )
     summaries.sort(key=_slice_sort_key)
@@ -106,6 +106,9 @@ class DxShell:
         self.focus_index = 0
         self.keyboard_focus = "feed"
         self.status = "j/k=move  enter=route target  space=expand  tab=prompt/feed  c=drawer  r=refresh  q=quit"
+        # Tracks the last (rows, cols) sent to each runtime session so we only
+        # call resize() when dimensions actually change.
+        self._last_resize: dict[int, tuple[int, int]] = {}
         self.refresh()
 
     def stop(self) -> None:
@@ -474,6 +477,15 @@ class DxShell:
             row = 2
             if layout.dominant is not None and row <= feed_bottom:
                 dominant = layout.dominant
+                # Propagate terminal size to the dominant PTY session whenever
+                # dimensions change so embedded TUIs reflow correctly.
+                if dominant.runtime_session_id is not None and self.pty_manager is not None:
+                    dom_rows = max(layout.dominant_height - 1, 1)
+                    dom_cols = max(width - 6, 1)
+                    prev = self._last_resize.get(dominant.runtime_session_id)
+                    if prev != (dom_rows, dom_cols):
+                        self.pty_manager.resize(dominant.runtime_session_id, dom_rows, dom_cols)
+                        self._last_resize[dominant.runtime_session_id] = (dom_rows, dom_cols)
                 focused = self.focused_summary()
                 dominant_focus = focused is not None and focused.id == dominant.id and self.keyboard_focus == "feed"
                 prefix = "▶" if dominant_focus else " "

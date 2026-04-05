@@ -1,15 +1,36 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import pty
+import re
 import select
 import shlex
+import struct
 import subprocess
+import termios
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
+
+# Matches: OSC sequences (ESC ] ... BEL), CSI sequences (ESC [ ... letter),
+# and 2-char Fe sequences (ESC @-_).  OSC must come before the Fe catch-all
+# because ']' (0x5D) falls inside the [@-_] range.  Used to strip VT/ANSI
+# codes from output before storing lines so the dx feed shows plain text.
+_ANSI_ESC = re.compile(
+    r"\x1b(?:"
+    r"\][^\x07\x1b]*\x07"    # OSC  — ESC ] ... BEL  (must precede Fe catch-all)
+    r"|\[[0-?]*[ -/]*[@-~]"  # CSI  — ESC [ ... final-byte
+    r"|[@-Z\\-_]"             # Fe   — ESC + one byte 0x40-0x5F
+    r")"
+)
+
+
+def strip_ansi(text: str) -> str:
+    """Remove ANSI/VT escape sequences, returning plain text."""
+    return _ANSI_ESC.sub("", text)
 
 
 @dataclass
@@ -28,6 +49,8 @@ class TerminalSession:
     display_state: str = "expanded"  # "collapsed", "expanded"
     active_task_id: int | None = None
     agent_id: int | None = None
+    rows: int = 24
+    cols: int = 80
 
 
 class PTYManager:
@@ -46,9 +69,19 @@ class PTYManager:
         cwd: Path | None = None,
         lex_root: Path | None = None,
         lex_session_id: str | None = None,
+        rows: int = 24,
+        cols: int = 80,
     ) -> int:
         cwd = cwd or Path.cwd()
         master_fd, slave_fd = pty.openpty()
+
+        # Set initial window size before the child process starts so it sees
+        # the correct dimensions from the very first TIOCGWINSZ call.
+        try:
+            winsize = struct.pack("HHHH", rows, cols, 0, 0)
+            fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
+        except OSError:
+            pass  # best-effort; resize() can correct it later
 
         # Set non-blocking
         os.set_blocking(master_fd, False)
@@ -94,7 +127,9 @@ class PTYManager:
             pid=proc.pid,
             proc=proc,
             master_fd=master_fd,
-            status="running"
+            status="running",
+            rows=rows,
+            cols=cols,
         )
 
         with self._lock:
@@ -158,23 +193,25 @@ class PTYManager:
             session = self.sessions.get(session_id)
             if not session:
                 return
-            
-            # Simple line-based buffering for the prototype
-            # Use splitlines(keepends=True) to preserve formatting better if needed,
-            # but for now we'll stick to a simple list of lines.
-            new_lines = data.splitlines()
+
+            # Check attention patterns on raw data before stripping (escape
+            # sequences can surround the prompt text we want to detect).
+            if any(p in data for p in ["(y/n)", "> ", "input:", "? "]):
+                session.attention_flag = True
+
+            # Strip ANSI/VT escape sequences so the dx feed shows plain text.
+            clean = strip_ansi(data)
+            new_lines = [line for line in clean.splitlines() if line]
+            if not new_lines:
+                return
             session.output.extend(new_lines)
-            
+
             # Limit scrollback
             if len(session.output) > 10000:
                 session.output = session.output[-10000:]
-            
+
             if session.display_state == "collapsed":
                 session.unread_count += len(new_lines)
-            
-            # Basic pattern matching for attention
-            if any(p in data for p in ["(y/n)", "> ", "input:", "? "]):
-                session.attention_flag = True
 
     def _handle_exit(self, session_id: int):
         with self._lock:
@@ -210,11 +247,7 @@ class PTYManager:
             return list(self.sessions.values())
 
     def resize(self, session_id: int, rows: int, cols: int) -> None:
-        """Send SIGWINCH with new terminal dimensions to the session process."""
-        import fcntl
-        import struct
-        import termios
-
+        """Update terminal window size and send SIGWINCH to the session process."""
         with self._lock:
             session = self.sessions.get(session_id)
             if not session or session.master_fd is None:
@@ -224,6 +257,11 @@ class PTYManager:
         try:
             winsize = struct.pack("HHHH", rows, cols, 0, 0)
             fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
+            with self._lock:
+                session = self.sessions.get(session_id)
+                if session:
+                    session.rows = rows
+                    session.cols = cols
         except OSError:
             pass
 
