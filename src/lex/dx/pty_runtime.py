@@ -45,7 +45,7 @@ class PTYManager:
         cmd: str,
         cwd: Path | None = None,
         lex_root: Path | None = None,
-        session_id: str | None = None,
+        lex_session_id: str | None = None,
     ) -> int:
         cwd = cwd or Path.cwd()
         master_fd, slave_fd = pty.openpty()
@@ -57,9 +57,9 @@ class PTYManager:
         env["TERM"] = "xterm-256color"
         if lex_root is not None:
             env["LEX_ROOT"] = str(lex_root)
-        if session_id is not None:
-            env["LEX_SESSION_ID"] = session_id
-        
+        if lex_session_id is not None:
+            env["LEX_SESSION_ID"] = lex_session_id
+
         proc = subprocess.Popen(
             shlex.split(cmd),
             stdin=slave_fd,
@@ -70,16 +70,16 @@ class PTYManager:
             close_fds=True,
             start_new_session=True
         )
-        
+
         # Close slave_fd in parent
         os.close(slave_fd)
 
-        session_id = self._next_id
+        new_id = self._next_id
         self._next_id += 1
-        
+
         session = TerminalSession(
-            id=session_id,
-            title=f"{kind}-{session_id}",
+            id=new_id,
+            title=f"{kind}-{new_id}",
             kind=kind,
             cwd=cwd,
             pid=proc.pid,
@@ -87,11 +87,11 @@ class PTYManager:
             master_fd=master_fd,
             status="running"
         )
-        
+
         with self._lock:
-            self.sessions[session_id] = session
-            
-        return session_id
+            self.sessions[new_id] = session
+
+        return new_id
 
     def write(self, session_id: int, text: str):
         with self._lock:
@@ -123,8 +123,14 @@ class PTYManager:
                 time.sleep(0.1)
                 continue
             
-            readable, _, _ = select.select(list(fds.keys()), [], [], 0.1)
-            
+            try:
+                readable, _, _ = select.select(list(fds.keys()), [], [], 0.1)
+            except (OSError, ValueError):
+                # A fd was closed between building the snapshot and calling
+                # select (e.g. close() or stop() ran concurrently). Skip this
+                # iteration; the next pass will build a fresh fd list.
+                continue
+
             for fd in readable:
                 session_id = fds[fd]
                 try:
@@ -182,12 +188,10 @@ class PTYManager:
         """Terminate a session and its associated process."""
         with self._lock:
             session = self.sessions.get(session_id)
-            if not session:
-                return
-            if session.proc and session.proc.poll() is None:
-                session.proc.terminate()
-            self._handle_exit(session_id)
-            # Remove from registry
+        if not session:
+            return
+        self._terminate_session(session)
+        with self._lock:
             if session_id in self.sessions:
                 del self.sessions[session_id]
 
@@ -228,7 +232,34 @@ class PTYManager:
     def stop(self):
         self._stop_event.set()
         with self._lock:
-            for session in self.sessions.values():
-                if session.master_fd is not None:
+            sessions = list(self.sessions.values())
+        for session in sessions:
+            self._terminate_session(session)
+        self._thread.join(timeout=1.0)
+        with self._lock:
+            self.sessions.clear()
+
+    def _terminate_session(self, session: TerminalSession) -> None:
+        # Terminate the process outside the lock — proc.wait() can take time.
+        if session.proc and session.proc.poll() is None:
+            try:
+                session.proc.terminate()
+                session.proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    session.proc.kill()
+                    session.proc.wait(timeout=1.0)
+                except Exception:
+                    pass
+        # Close the master fd under the lock to avoid racing with _handle_exit,
+        # which also mutates master_fd under the lock. Without this, two callers
+        # could both see master_fd != None and attempt os.close() on the same fd,
+        # potentially closing a fd that was reallocated to a different file.
+        with self._lock:
+            if session.master_fd is not None:
+                try:
                     os.close(session.master_fd)
-                    session.master_fd = None
+                except OSError:
+                    pass
+                session.master_fd = None
+            session.status = "exited"
