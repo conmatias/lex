@@ -1,0 +1,528 @@
+from __future__ import annotations
+
+import curses
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Sequence
+
+from lex.dashboard import load_dashboard_state
+from lex.dx.app import build_diff, build_dx_view
+from lex.dx.commands import RoutingController
+from lex.dx.pty_runtime import PTYManager, TerminalSession
+
+
+@dataclass(frozen=True)
+class SliceSummary:
+    id: str
+    title: str
+    state: str
+    task_label: str
+    detail: str
+    expanded: bool = False
+    source: str = "agent"
+    runtime_kind: str | None = None
+    runtime_session_id: int | None = None
+    attention_flag: bool = False
+    unread_count: int = 0
+    output_tail: tuple[str, ...] = ()
+
+
+@dataclass
+class PromptState:
+    buffer: str = ""
+    history: list[str] = field(default_factory=list)
+    history_index: int | None = None
+
+
+def build_shell_summaries(
+    root: Path,
+    terminal_sessions: Sequence[TerminalSession] | None = None,
+) -> list[SliceSummary]:
+    view = build_dx_view(root)
+    summaries: list[SliceSummary] = []
+    for agent in view.agents:
+        task_label = f"#{agent.task_id} {agent.task_title}" if agent.task_id and agent.task_title else "no task"
+        detail = f"changed={agent.changed_file_count} claimed={agent.claimed_path_count}"
+        summaries.append(
+            SliceSummary(
+                id=agent.agent_name,
+                title=agent.agent_name,
+                state=agent.roster_state,
+                task_label=task_label,
+                detail=detail,
+            )
+        )
+    for session in terminal_sessions or ():
+        cwd_label = session.cwd.name or str(session.cwd)
+        pid_label = f"pid={session.pid}" if session.pid is not None else "pid=?"
+        attention = "attention" if session.attention_flag else session.status
+        detail = f"{cwd_label}  {pid_label}  unread={session.unread_count}"
+        summaries.append(
+            SliceSummary(
+                id=session.title,
+                title=session.title,
+                state=attention,
+                task_label=f"PTY {session.kind}",
+                detail=detail,
+                source="runtime",
+                runtime_kind=session.kind,
+                runtime_session_id=session.id,
+                attention_flag=session.attention_flag,
+                unread_count=session.unread_count,
+                output_tail=tuple(session.output[-5:]),
+            )
+        )
+    summaries.sort(key=_slice_sort_key)
+    return summaries
+
+
+class DxShell:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        pty_manager: PTYManager | None = None,
+        pty_manager_factory: Callable[[], PTYManager] = PTYManager,
+        runtime_command_builder: Callable[[str], str] | None = None,
+    ):
+        self.root = root
+        self.prompt = PromptState()
+        self.summaries: list[SliceSummary] = []
+        self._pty_manager_factory = pty_manager_factory
+        self._runtime_command_builder = runtime_command_builder or _default_runtime_command
+        self.controller = RoutingController(
+            resolve_slice=self._resolve_slice,
+            list_slices=lambda: [summary.id for summary in self.summaries],
+        )
+        self.pty_manager: PTYManager | None = pty_manager
+        self.focus_index = 0
+        self.keyboard_focus = "feed"
+        self.status = "j/k=move  enter=route target  space=expand  tab=prompt/feed  c=drawer  r=refresh  q=quit"
+        self.refresh()
+
+    def stop(self) -> None:
+        if self.pty_manager is not None:
+            self.pty_manager.stop()
+            self.pty_manager = None
+
+    def refresh(self) -> None:
+        self.state = load_dashboard_state(self.root)
+        summaries = build_shell_summaries(self.root, terminal_sessions=self._list_runtime_sessions())
+        expanded_id = self.controller.state.expanded_slice_id
+        focused_id = self.controller.state.focused_slice_id
+        self.summaries = [
+            SliceSummary(
+                id=summary.id,
+                title=summary.title,
+                state=summary.state,
+                task_label=summary.task_label,
+                detail=summary.detail,
+                expanded=summary.id == expanded_id,
+                source=summary.source,
+                runtime_kind=summary.runtime_kind,
+                runtime_session_id=summary.runtime_session_id,
+                attention_flag=summary.attention_flag,
+                unread_count=summary.unread_count,
+                output_tail=summary.output_tail,
+            )
+            for summary in summaries
+        ]
+        if focused_id is not None:
+            self.focus_index = next(
+                (idx for idx, summary in enumerate(self.summaries) if summary.id == focused_id),
+                min(self.focus_index, max(len(self.summaries) - 1, 0)),
+            )
+        else:
+            self.focus_index = min(self.focus_index, max(len(self.summaries) - 1, 0))
+        if self.summaries and focused_id is None:
+            self.controller.set_slice_focus(self.summaries[self.focus_index].id)
+
+    def _resolve_slice(self, ref: str) -> str | None:
+        matches = [summary.id for summary in self.summaries if summary.id == ref or summary.id.startswith(ref)]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            return "ambiguous:" + ",".join(matches)
+        return None
+
+    def focused_summary(self) -> SliceSummary | None:
+        if not self.summaries:
+            return None
+        return self.summaries[self.focus_index]
+
+    def header_text(self) -> str:
+        target = self.controller.state.routing_target_id or "no target"
+        focused = self.focused_summary()
+        task_label = focused.task_label if focused else "no slice"
+        return f"dx  ›  {target}  ›  {task_label}"
+
+    def submit_prompt(self, raw: str):
+        result = self.controller.submit(raw)
+        text = raw.strip()
+        if text:
+            self.prompt.history.append(text)
+        self.prompt.history_index = None
+        self.prompt.buffer = ""
+        patch = result.state_patch or {}
+        if "spawn_kind" in patch:
+            self._spawn_runtime(patch["spawn_kind"])
+        elif "split_kind" in patch:
+            self._spawn_runtime(self._resolve_split_kind(patch["split_kind"]))
+        elif "one_shot_target" in patch and "one_shot_message" in patch:
+            self._send_to_runtime(patch["one_shot_target"], patch["one_shot_message"], fallback_status=result.confirmation)
+        elif "last_sent_to" in patch:
+            self._send_to_runtime(patch["last_sent_to"], text, fallback_status=result.confirmation)
+        elif "review_target" in patch and "review_answer" in patch:
+            self._send_to_runtime(patch["review_target"], patch["review_answer"], fallback_status=result.confirmation)
+        elif "stop_target" in patch:
+            self._close_runtime(patch["stop_target"], verb="stopped")
+        elif result.confirmation:
+            self.status = result.confirmation
+        elif result.error_message:
+            self.status = result.error_message
+        if "routing_target_id" in patch or "expanded_slice_id" in patch or "drawer_open" in patch:
+            self.refresh()
+        return result
+
+    def _list_runtime_sessions(self) -> list[TerminalSession]:
+        if self.pty_manager is None:
+            return []
+        return self.pty_manager.list_sessions()
+
+    def _find_runtime_session(self, slice_id: str) -> TerminalSession | None:
+        if self.pty_manager is None:
+            return None
+        for session in self.pty_manager.list_sessions():
+            if session.title == slice_id:
+                return session
+        return None
+
+    def _spawn_runtime(self, kind: str) -> None:
+        manager = self._ensure_pty_manager()
+        session_id = manager.spawn(
+            kind,
+            self._runtime_command_builder(kind),
+            cwd=self.root,
+            lex_root=self.root,
+        )
+        session = manager.get_session(session_id)
+        if session is None:
+            self.status = f"failed to spawn {kind}"
+            return
+        self.controller.set_slice_focus(session.title)
+        self.controller.set_routing_target(session.title)
+        self.controller.set_expanded_slice(session.title)
+        self.refresh()
+        self.focus_index = next((idx for idx, summary in enumerate(self.summaries) if summary.id == session.title), 0)
+        self.status = f"spawned {session.title}"
+
+    def _resolve_split_kind(self, requested: str | None) -> str:
+        if requested in {"claude", "codex", "gemini", "shell"}:
+            return requested
+        focused = self.focused_summary()
+        if focused and focused.runtime_kind:
+            return focused.runtime_kind
+        return "shell"
+
+    def _send_to_runtime(self, slice_id: str, message: str, *, fallback_status: str | None) -> None:
+        session = self._find_runtime_session(slice_id)
+        if session is None:
+            self.status = f"slice {slice_id} has no PTY session"
+            return
+        manager = self._ensure_pty_manager()
+        manager.write(session.id, message)
+        manager.set_display_state(session.id, "expanded")
+        self.controller.set_expanded_slice(slice_id)
+        self.status = fallback_status or f"sent to {slice_id}"
+        self.refresh()
+
+    def _close_runtime(self, slice_id: str, *, verb: str) -> None:
+        session = self._find_runtime_session(slice_id)
+        if session is None or self.pty_manager is None:
+            self.status = f"slice {slice_id} has no PTY session"
+            return
+        self.pty_manager.close(session.id)
+        if self.controller.state.routing_target_id == slice_id:
+            self.controller.set_routing_target(None)
+        if self.controller.state.expanded_slice_id == slice_id:
+            self.controller.set_expanded_slice(None)
+        if self.controller.state.focused_slice_id == slice_id:
+            self.controller.set_slice_focus(None)
+        self.refresh()
+        self.status = f"{verb} {slice_id}"
+
+    def _ensure_pty_manager(self) -> PTYManager:
+        if self.pty_manager is None:
+            self.pty_manager = self._pty_manager_factory()
+        return self.pty_manager
+
+    def expanded_lines(self, summary: SliceSummary, *, max_lines: int) -> list[str]:
+        if summary.source != "runtime":
+            return [f"{summary.task_label}  {summary.detail}", "No live PTY session attached to this slice."]
+        lines: list[str] = [f"{summary.task_label}  {summary.detail}"]
+        tail = list(summary.output_tail[-max(max_lines - 2, 1):]) if summary.output_tail else ["(no terminal output yet)"]
+        lines.extend(tail)
+        actions = "[y] approve  [n] deny  [enter] route  [space] collapse"
+        if summary.attention_flag:
+            actions = "[y] approve  [n] deny  [m] prompt  [space] collapse"
+        lines.append(actions)
+        return lines[:max_lines]
+
+    def drawer_lines(self, *, height: int) -> list[str]:
+        view = self.controller.state.drawer_view or "help"
+        subject = self.controller.state.drawer_subject
+        if view == "help":
+            return self.controller.command_help(subject).splitlines()[:height]
+        if view == "terminals":
+            sessions = self._list_runtime_sessions()
+            if not sessions:
+                return ["No active PTY sessions."]
+            lines = [
+                f"{session.title}  [{session.status}]  {session.kind}  unread={session.unread_count}"
+                for session in sessions
+            ]
+            return lines[:height]
+        if view == "files":
+            target = self.controller.state.routing_target_id
+            summary = next((item for item in self.summaries if item.id == target), None)
+            if summary is None or summary.source != "agent":
+                return ["No agent file context for the current routing target."]
+            view_state = build_dx_view(self.root)
+            agent = next((agent for agent in view_state.agents if agent.agent_name == summary.id), None)
+            if agent is None or not agent.files:
+                return ["No claimed or changed files."]
+            return [file.path for file in agent.files[:height]]
+        if view == "tasks":
+            target = self.controller.state.routing_target_id or self.controller.state.focused_slice_id
+            if target is None:
+                return ["No routing target."]
+            summary = next((item for item in self.summaries if item.id == target), None)
+            if summary is None:
+                return ["No slice selected."]
+            return [summary.task_label, summary.detail]
+        if view == "diff":
+            if not subject:
+                return ["No diff path selected."]
+            target = self.controller.state.routing_target_id
+            base_ref = None
+            if target:
+                view_state = build_dx_view(self.root)
+                agent = next((agent for agent in view_state.agents if agent.agent_name == target), None)
+                if agent and agent.session_id is not None:
+                    session = next((row for row in self.state.sessions if row["agent_name"] == target), None)
+                    if session:
+                        base_ref = session.get("git_base_ref")
+            return build_diff(self.root, base_ref, subject).splitlines()[:height]
+        return ["Unsupported drawer view."]
+
+    def move_focus(self, delta: int) -> None:
+        if not self.summaries:
+            return
+        self.focus_index = max(0, min(self.focus_index + delta, len(self.summaries) - 1))
+        focused = self.focused_summary()
+        if focused is not None:
+            self.controller.set_slice_focus(focused.id)
+
+    def route_to_focused(self) -> None:
+        summary = self.focused_summary()
+        if summary is None:
+            self.status = "no slice focused"
+            return
+        self.controller.set_routing_target(summary.id)
+        self.status = f"routing target -> {summary.id}"
+
+    def toggle_expand(self) -> None:
+        summary = self.focused_summary()
+        if summary is None:
+            self.status = "no slice focused"
+            return
+        new_id = None if self.controller.state.expanded_slice_id == summary.id else summary.id
+        self.controller.set_expanded_slice(new_id)
+        if summary.runtime_session_id is not None:
+            state = "expanded" if new_id is not None else "collapsed"
+            self._ensure_pty_manager().set_display_state(summary.runtime_session_id, state)
+        if new_id is not None and summary.runtime_session_id is not None:
+            self.controller.set_routing_target(summary.id)
+        self.refresh()
+        self.status = "expanded" if new_id else "collapsed"
+
+    def toggle_drawer(self) -> None:
+        state = self.controller.state
+        state.drawer_open = not state.drawer_open
+        if not state.drawer_open:
+            state.drawer_view = None
+            state.drawer_subject = None
+        else:
+            state.drawer_view = state.drawer_view or "help"
+        self.status = f"drawer {'open' if state.drawer_open else 'closed'}"
+
+    def history_up(self) -> None:
+        if not self.prompt.history:
+            return
+        if self.prompt.history_index is None:
+            self.prompt.history_index = len(self.prompt.history) - 1
+        else:
+            self.prompt.history_index = max(0, self.prompt.history_index - 1)
+        self.prompt.buffer = self.prompt.history[self.prompt.history_index]
+
+    def history_down(self) -> None:
+        if self.prompt.history_index is None:
+            return
+        if self.prompt.history_index >= len(self.prompt.history) - 1:
+            self.prompt.history_index = None
+            self.prompt.buffer = ""
+        else:
+            self.prompt.history_index += 1
+            self.prompt.buffer = self.prompt.history[self.prompt.history_index]
+
+    def handle_key(self, stdscr, ch: int) -> bool:
+        if ch in (ord("q"), 27) and self.keyboard_focus == "feed":
+            return False
+        if ch == 9:
+            self.keyboard_focus = "prompt" if self.keyboard_focus == "feed" else "feed"
+            return True
+        if self.keyboard_focus == "feed":
+            if ch in (ord("j"), curses.KEY_DOWN):
+                self.move_focus(1)
+            elif ch in (ord("k"), curses.KEY_UP):
+                self.move_focus(-1)
+            elif ch in (10, 13):
+                self.route_to_focused()
+            elif ch == ord(" "):
+                self.toggle_expand()
+            elif ch == ord("c"):
+                self.toggle_drawer()
+            elif ch == ord("r"):
+                self.refresh()
+            elif ch == ord("y"):
+                summary = self.focused_summary()
+                if summary is not None:
+                    self._send_to_runtime(summary.id, "y", fallback_status=f"approved {summary.id}")
+            elif ch == ord("n"):
+                summary = self.focused_summary()
+                if summary is not None:
+                    self._send_to_runtime(summary.id, "n", fallback_status=f"denied {summary.id}")
+            elif ch == ord("m"):
+                self.keyboard_focus = "prompt"
+            return True
+        if ch in (curses.KEY_UP,):
+            self.history_up()
+        elif ch in (curses.KEY_DOWN,):
+            self.history_down()
+        elif ch in (10, 13):
+            self.submit_prompt(self.prompt.buffer)
+        elif ch in (curses.KEY_BACKSPACE, 127):
+            self.prompt.buffer = self.prompt.buffer[:-1]
+        elif ch == 27:
+            self.prompt.buffer = ""
+            self.keyboard_focus = "feed"
+        elif 32 <= ch <= 126:
+            self.prompt.buffer += chr(ch)
+        return True
+
+    def render(self, stdscr) -> None:
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        stdscr.addnstr(0, 0, self.header_text().ljust(width - 1), width - 1, curses.A_REVERSE)
+
+        prompt_row = height - 1
+        drawer_height = max(height // 3, 4) if self.controller.state.drawer_open else 0
+        feed_bottom = prompt_row - drawer_height - 1
+
+        if not self.summaries:
+            stdscr.addnstr(2, 2, "No active slices", width - 4)
+        else:
+            row = 2
+            for idx, summary in enumerate(self.summaries):
+                if row > feed_bottom:
+                    break
+                focused = idx == self.focus_index and self.keyboard_focus == "feed"
+                prefix = "▶" if focused else " "
+                marker = "▼" if summary.expanded else _state_icon(summary)
+                line = f"{prefix} {marker} {summary.title} [{summary.state}]  {summary.task_label}  {summary.detail}"
+                attr = curses.A_BOLD if focused else curses.A_NORMAL
+                stdscr.addnstr(row, 1, line, width - 2, attr)
+                row += 1
+                if summary.expanded:
+                    available = max(feed_bottom - row + 1, 0)
+                    for line in self.expanded_lines(summary, max_lines=available):
+                        if row > feed_bottom:
+                            break
+                        stdscr.addnstr(row, 4, line, width - 6)
+                        row += 1
+
+        if self.controller.state.drawer_open:
+            drawer_top = prompt_row - drawer_height
+            stdscr.hline(drawer_top, 0, "-", width)
+            drawer_title = f" drawer: {self.controller.state.drawer_view or 'help'} "
+            stdscr.addnstr(drawer_top, 2, drawer_title, width - 4, curses.A_BOLD)
+            drawer_lines = self.drawer_lines(height=max(drawer_height - 1, 0))
+            for idx, line in enumerate(drawer_lines[: max(drawer_height - 1, 0)]):
+                stdscr.addnstr(drawer_top + 1 + idx, 2, line, width - 4)
+
+        prompt_prefix = "› " if self.keyboard_focus == "prompt" else "  "
+        stdscr.addnstr(prompt_row, 0, (prompt_prefix + self.prompt.buffer).ljust(width - 1), width - 1, curses.A_REVERSE)
+        if prompt_row - 1 > 0:
+            stdscr.addnstr(prompt_row - 1, 0, self.status.ljust(width - 1), width - 1)
+        stdscr.refresh()
+
+    def run(self) -> None:
+        curses.wrapper(self._main)
+
+    def _main(self, stdscr) -> None:
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        stdscr.keypad(True)
+        while True:
+            self.refresh()
+            self.render(stdscr)
+            ch = stdscr.getch()
+            if not self.handle_key(stdscr, ch):
+                return
+
+
+def run_shell(root: Path) -> None:
+    shell = DxShell(root)
+    try:
+        shell.run()
+    finally:
+        shell.stop()
+
+
+def _slice_sort_key(summary: SliceSummary) -> tuple[int, str]:
+    priority = {
+        "attention": 0,
+        "review": 0,
+        "permission": 0,
+        "active": 1,
+        "running": 1,
+        "waiting": 2,
+        "blocked": 3,
+        "idle": 4,
+        "stale": 5,
+        "exited": 6,
+    }
+    return (priority.get(summary.state, 3), summary.title)
+
+
+def _state_icon(summary: SliceSummary) -> str:
+    if summary.attention_flag:
+        return "▲"
+    return {
+        "active": "●",
+        "running": "⊙",
+        "idle": "○",
+        "waiting": "⊙",
+        "blocked": "⚠",
+        "stale": "–",
+        "exited": "×",
+    }.get(summary.state, "•")
+
+
+def _default_runtime_command(kind: str) -> str:
+    if kind == "shell":
+        return os.environ.get("SHELL", "bash")
+    return f"python3 -c \"print('dx {kind} slice ready'); import time; time.sleep(600)\""

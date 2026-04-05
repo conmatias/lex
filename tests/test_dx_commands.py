@@ -114,12 +114,31 @@ class TestTokenizer:
 
 class TestVerbRecognition:
     def test_all_canonical_verbs_recognized(self):
-        verbs = ["help", "commands", "focus", "route", "clear", "where",
-                 "spawn", "split", "close", "stop", "resume", "terminals",
-                 "send", "broadcast", "reply", "tasks", "agents", "files",
-                 "diff", "approve", "deny"]
-        for v in verbs:
-            r = parse(f"/{v}")
+        samples = {
+            "help": "/help",
+            "commands": "/commands",
+            "focus": "/focus codex",
+            "route": "/route codex",
+            "clear": "/clear",
+            "where": "/where",
+            "spawn": "/spawn codex",
+            "split": "/split codex",
+            "close": "/close codex",
+            "stop": "/stop codex",
+            "resume": "/resume codex",
+            "terminals": "/terminals",
+            "send": "/send codex hello",
+            "broadcast": "/broadcast hello",
+            "reply": "/reply hello",
+            "tasks": "/tasks",
+            "agents": "/agents",
+            "files": "/files",
+            "diff": "/diff src/lex/db.py",
+            "approve": "/approve codex",
+            "deny": "/deny codex",
+        }
+        for v, sample in samples.items():
+            r = parse(sample)
             assert r.kind != "error", f"/{v} should be recognized"
 
     def test_route_is_alias_for_focus(self):

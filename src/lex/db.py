@@ -9,6 +9,7 @@ from typing import Iterable
 
 DEFAULT_LEX_DIRNAME = ".lex"
 DEFAULT_DB_NAME = "lex.db"
+_OPEN_CONNECTIONS: list[sqlite3.Connection] = []
 ROLE_MIGRATIONS: dict[str, tuple[str, str]] = {
     "engineer": ("dev", "engineer"),
     "devops": ("dev", "devops"),
@@ -569,7 +570,24 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
+    _OPEN_CONNECTIONS.append(conn)
     return conn
+
+
+def connection_checkpoint() -> int:
+    return len(_OPEN_CONNECTIONS)
+
+
+def close_connections_since(checkpoint: int) -> None:
+    if checkpoint < 0:
+        checkpoint = 0
+    tail = _OPEN_CONNECTIONS[checkpoint:]
+    del _OPEN_CONNECTIONS[checkpoint:]
+    for conn in tail:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def initialize_database(conn: sqlite3.Connection) -> None:

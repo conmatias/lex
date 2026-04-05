@@ -2,7 +2,7 @@ from argparse import Namespace
 
 from lex.cli import AGENT_NAME_RE, allocate_agent_name, build_session_fingerprint, cmd_agent_identify, main, normalize_agent_role, resolve_install_options
 from lex.dashboard import load_dashboard_state
-from lex.db import connect, ensure_workspace, initialize_database
+from lex.db import connect, connection_checkpoint, ensure_workspace, initialize_database
 from lex.installer import InstallContext, install_scaffold
 from lex.merge_workflow import apply_proposal, create_merge_packet, unified_diff
 
@@ -129,6 +129,22 @@ def test_dx_command_dispatches_to_dx_runner(tmp_path, monkeypatch):
     main(["--root", str(tmp_path), "dx"])
 
     assert called["root"] == tmp_path.resolve()
+
+
+def test_main_closes_connections_opened_during_invocation(tmp_path):
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    conn.execute(
+        "INSERT INTO agents (name, kind, role, specialty, status) VALUES ('codex-pm-dalton', 'codex', 'pm', '', 'active')"
+    )
+    conn.commit()
+    checkpoint = connection_checkpoint()
+
+    for _ in range(5):
+        main(["--root", str(tmp_path), "session", "list"])
+
+    assert connection_checkpoint() == checkpoint
 
 
 def test_build_session_fingerprint_returns_hash_and_label():

@@ -23,18 +23,21 @@ class DashboardState:
 def load_dashboard_state(root: Path) -> DashboardState:
     paths = ensure_workspace(root)
     conn = connect(paths.db_path)
-    initialize_database(conn)
-    return DashboardState(
-        root=root,
-        summary=_query_summary(conn),
-        agents=_query_agents(conn),
-        sessions=_query_sessions(conn),
-        tasks=_query_tasks(conn),
-        inbox=_query_inbox(conn),
-        events=_query_events(conn),
-        task_details=_query_task_details(conn),
-        dx_roster=_query_dx_roster(conn),
-    )
+    try:
+        initialize_database(conn)
+        return DashboardState(
+            root=root,
+            summary=_query_summary(conn),
+            agents=_query_agents(conn),
+            sessions=_query_sessions(conn),
+            tasks=_query_tasks(conn),
+            inbox=_query_inbox(conn),
+            events=_query_events(conn),
+            task_details=_query_task_details(conn),
+            dx_roster=_query_dx_roster(conn),
+        )
+    finally:
+        conn.close()
 
 
 def _rows(conn: sqlite3.Connection, query: str, params: tuple = ()) -> list[dict]:

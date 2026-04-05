@@ -5,6 +5,7 @@ import tomllib
 from lex.dashboard import load_dashboard_state
 from lex.db import connect, ensure_workspace, initialize_database
 from lex.dx.app import (
+    DxTui,
     build_diff,
     build_dx_view,
     current_actions,
@@ -14,6 +15,7 @@ from lex.dx.app import (
     dx_update_task_priority,
     dx_update_task_status,
     main,
+    read_file_contents,
 )
 
 
@@ -97,6 +99,11 @@ def test_build_diff_uses_git_base_ref(tmp_path):
 
     assert "diff --git" in diff
     assert "+change" in diff
+
+
+def test_read_file_contents_handles_directory_claim(tmp_path):
+    message = read_file_contents(tmp_path, ".")
+    assert message == "Directory claim: ."
 
 
 def test_dx_pyproject_exposes_console_script():
@@ -211,3 +218,42 @@ def test_dx_annotation_and_flag_helpers_write_events(tmp_path):
     assert [row["event_type"] for row in rows] == ["dx.annotation", "dx.flag"]
     assert json.loads(rows[0]["payload_json"])["provenance"] == "dx"
     assert json.loads(rows[1]["payload_json"])["file"] == "src/demo.py"
+
+
+def test_dx_enter_from_roster_moves_focus_to_files_without_opening(tmp_path):
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    agent_id = _setup_agent(conn)
+    _setup_session(conn, agent_id, tmp_path)
+    _setup_task(conn, agent_id, claimed=["."])
+    conn.commit()
+
+    tui = DxTui(tmp_path)
+
+    assert tui.focus == "roster"
+    assert tui.tabs == []
+
+    tui._open_selected_file()
+
+    assert tui.focus == "files"
+    assert tui.tabs == []
+    assert tui.status == "select a file claim to open"
+
+
+def test_dx_quick_edit_rejects_directory_claim(tmp_path):
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    agent_id = _setup_agent(conn)
+    _setup_session(conn, agent_id, tmp_path)
+    _setup_task(conn, agent_id, claimed=["."])
+    conn.commit()
+
+    tui = DxTui(tmp_path)
+    tui.focus = "files"
+
+    tui._enter_quick_edit(None)
+
+    assert tui.mode == "diff"
+    assert tui.status == "cannot quick-edit directory claim: ."

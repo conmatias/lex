@@ -42,7 +42,7 @@ from lex.coordination import (
 )
 from lex.dx import run_dx
 from lex.discovery import LexDiscovery
-from lex.db import BUILTIN_SPECIALTIES, connect, derive_event_provenance, detect_path_conflicts, ensure_workspace, fetch_one, find_lex_root, initialize_database, list_specialties, log_event, resolve_paths, run_roster_preflight
+from lex.db import BUILTIN_SPECIALTIES, close_connections_since, connect, connection_checkpoint, derive_event_provenance, detect_path_conflicts, ensure_workspace, fetch_one, find_lex_root, initialize_database, list_specialties, log_event, resolve_paths, run_roster_preflight
 from lex.dispatch import (
     VALID_WORKER_APPROVAL_POLICIES,
     command_preview,
@@ -3162,24 +3162,28 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.command is None:
-        root = Path(args.root).resolve()
-        if sys.stdin.isatty() and sys.stdout.isatty():
-            try:
-                run_tui(root)
-            except Exception as exc:
-                if os.environ.get("LEX_DEBUG_TUI") == "1":
-                    raise
-                reason = f"{type(exc).__name__}: {exc}"
-                if isinstance(exc, curses.error):
-                    print(f"{CLI_COMMAND}: TUI unavailable, falling back to interactive shell ({reason})", file=sys.stderr)
-                else:
-                    print(f"{CLI_COMMAND}: TUI failed to start, falling back to interactive shell ({reason})", file=sys.stderr)
+    checkpoint = connection_checkpoint()
+    try:
+        if args.command is None:
+            root = Path(args.root).resolve()
+            if sys.stdin.isatty() and sys.stdout.isatty():
+                try:
+                    run_tui(root)
+                except Exception as exc:
+                    if os.environ.get("LEX_DEBUG_TUI") == "1":
+                        raise
+                    reason = f"{type(exc).__name__}: {exc}"
+                    if isinstance(exc, curses.error):
+                        print(f"{CLI_COMMAND}: TUI unavailable, falling back to interactive shell ({reason})", file=sys.stderr)
+                    else:
+                        print(f"{CLI_COMMAND}: TUI failed to start, falling back to interactive shell ({reason})", file=sys.stderr)
+                    run_interactive_shell(root)
+            else:
                 run_interactive_shell(root)
-        else:
-            run_interactive_shell(root)
-        return
-    args.func(args)
+            return
+        args.func(args)
+    finally:
+        close_connections_since(checkpoint)
 
 
 if __name__ == "__main__":

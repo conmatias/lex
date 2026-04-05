@@ -226,56 +226,65 @@ def current_actions(focus: str, mode: str, selected_file: DxFileItem | None = No
 def dx_send_message(root: Path, *, from_agent: str, task_id: int, body: str, subject: str = "dx intervention") -> None:
     paths = ensure_workspace(root)
     conn = connect(paths.db_path)
-    initialize_database(conn)
-    agent = get_agent(conn, from_agent)
-    get_task(conn, task_id)
-    conn.execute(
-        """
-        INSERT INTO messages (task_id, from_agent_id, type, subject, body)
-        VALUES (?, ?, 'note', ?, ?)
-        """,
-        (task_id, agent["id"], subject, body),
-    )
-    log_event(
-        conn,
-        "message.sent",
-        task_id=task_id,
-        agent_id=agent["id"],
-        payload={"type": "note", "to": None, "provenance": "dx"},
-    )
-    conn.commit()
+    try:
+        initialize_database(conn)
+        agent = get_agent(conn, from_agent)
+        get_task(conn, task_id)
+        conn.execute(
+            """
+            INSERT INTO messages (task_id, from_agent_id, type, subject, body)
+            VALUES (?, ?, 'note', ?, ?)
+            """,
+            (task_id, agent["id"], subject, body),
+        )
+        log_event(
+            conn,
+            "message.sent",
+            task_id=task_id,
+            agent_id=agent["id"],
+            payload={"type": "note", "to": None, "provenance": "dx"},
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def dx_log_annotation(root: Path, *, agent_name: str, task_id: int, path: str, note: str) -> None:
     paths = ensure_workspace(root)
     conn = connect(paths.db_path)
-    initialize_database(conn)
-    agent = get_agent(conn, agent_name)
-    get_task(conn, task_id)
-    log_event(
-        conn,
-        "dx.annotation",
-        task_id=task_id,
-        agent_id=agent["id"],
-        payload={"hunk": path, "note": note, "provenance": "dx"},
-    )
-    conn.commit()
+    try:
+        initialize_database(conn)
+        agent = get_agent(conn, agent_name)
+        get_task(conn, task_id)
+        log_event(
+            conn,
+            "dx.annotation",
+            task_id=task_id,
+            agent_id=agent["id"],
+            payload={"hunk": path, "note": note, "provenance": "dx"},
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def dx_flag_file(root: Path, *, agent_name: str, task_id: int, path: str, reason: str) -> None:
     paths = ensure_workspace(root)
     conn = connect(paths.db_path)
-    initialize_database(conn)
-    agent = get_agent(conn, agent_name)
-    get_task(conn, task_id)
-    log_event(
-        conn,
-        "dx.flag",
-        task_id=task_id,
-        agent_id=agent["id"],
-        payload={"file": path, "reason": reason, "provenance": "dx"},
-    )
-    conn.commit()
+    try:
+        initialize_database(conn)
+        agent = get_agent(conn, agent_name)
+        get_task(conn, task_id)
+        log_event(
+            conn,
+            "dx.flag",
+            task_id=task_id,
+            agent_id=agent["id"],
+            payload={"file": path, "reason": reason, "provenance": "dx"},
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def dx_log_edit_event(
@@ -289,63 +298,72 @@ def dx_log_edit_event(
 ) -> None:
     paths = ensure_workspace(root)
     conn = connect(paths.db_path)
-    initialize_database(conn)
-    agent = get_agent(conn, agent_name)
-    log_event(
-        conn,
-        "dx.edit",
-        task_id=task_id,
-        agent_id=agent["id"],
-        session_id=session_id,
-        payload={"file": path, "diff_summary": diff_summary, "provenance": "dx"},
-    )
-    conn.commit()
+    try:
+        initialize_database(conn)
+        agent = get_agent(conn, agent_name)
+        log_event(
+            conn,
+            "dx.edit",
+            task_id=task_id,
+            agent_id=agent["id"],
+            session_id=session_id,
+            payload={"file": path, "diff_summary": diff_summary, "provenance": "dx"},
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def dx_update_task_priority(root: Path, *, agent_name: str, task_id: int, priority: int) -> None:
     paths = ensure_workspace(root)
     conn = connect(paths.db_path)
-    initialize_database(conn)
-    agent = get_agent(conn, agent_name)
-    task = get_task(conn, task_id)
-    conn.execute(
-        "UPDATE tasks SET priority = ? WHERE id = ?",
-        (priority, task_id),
-    )
-    log_event(
-        conn,
-        "task.priority_changed",
-        task_id=task_id,
-        agent_id=agent["id"],
-        payload={"from": task["priority"], "to": priority, "provenance": "dx"},
-    )
-    conn.commit()
+    try:
+        initialize_database(conn)
+        agent = get_agent(conn, agent_name)
+        task = get_task(conn, task_id)
+        conn.execute(
+            "UPDATE tasks SET priority = ? WHERE id = ?",
+            (priority, task_id),
+        )
+        log_event(
+            conn,
+            "task.priority_changed",
+            task_id=task_id,
+            agent_id=agent["id"],
+            payload={"from": task["priority"], "to": priority, "provenance": "dx"},
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def dx_update_task_status(root: Path, *, agent_name: str, task_id: int, status: str) -> None:
     paths = ensure_workspace(root)
     conn = connect(paths.db_path)
-    initialize_database(conn)
-    agent = get_agent(conn, agent_name)
-    task = get_task(conn, task_id)
-    if status == "done":
-        conn.execute(
-            "UPDATE tasks SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (status, task_id),
+    try:
+        initialize_database(conn)
+        agent = get_agent(conn, agent_name)
+        task = get_task(conn, task_id)
+        if status == "done":
+            conn.execute(
+                "UPDATE tasks SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (status, task_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE tasks SET status = ?, completed_at = NULL WHERE id = ?",
+                (status, task_id),
+            )
+        log_event(
+            conn,
+            "task.status_changed",
+            task_id=task_id,
+            agent_id=agent["id"],
+            payload={"from": task["status"], "to": status, "provenance": "dx"},
         )
-    else:
-        conn.execute(
-            "UPDATE tasks SET status = ?, completed_at = NULL WHERE id = ?",
-            (status, task_id),
-        )
-    log_event(
-        conn,
-        "task.status_changed",
-        task_id=task_id,
-        agent_id=agent["id"],
-        payload={"from": task["status"], "to": status, "provenance": "dx"},
-    )
-    conn.commit()
+        conn.commit()
+    finally:
+        conn.close()
 
 
 VALID_TASK_STATES = (
