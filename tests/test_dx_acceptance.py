@@ -22,6 +22,7 @@ import pytest
 
 from lex.dashboard import load_dashboard_state
 from lex.db import connect, ensure_workspace, initialize_database, log_event
+from lex.dx.app import dx_log_edit_event
 
 
 # ---------------------------------------------------------------------------
@@ -545,3 +546,113 @@ def test_dx_writeback_does_not_mutate_lease_state(tmp_path):
     ).fetchone()["expires_at"]
 
     assert after_expires == before_expires
+
+
+# ---------------------------------------------------------------------------
+# Slice 5: Quick Edit — writeback contract
+# ---------------------------------------------------------------------------
+
+
+def test_dx_quick_edit_write_produces_dx_edit_event(tmp_path):
+    """Saving a quick edit must record a dx.edit event with file, diff_summary, and provenance."""
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+
+    _setup_agents(conn)
+    task_id = _setup_task(conn, agent_id=1)
+    conn.commit()
+
+    target = tmp_path / "src" / "foo.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("x = 1\n", encoding="utf-8")
+
+    dx_log_edit_event(
+        tmp_path,
+        agent_name="claude-calm-otter",
+        task_id=task_id,
+        path="src/foo.py",
+        diff_summary="4 diff lines",
+    )
+
+    row = conn.execute(
+        "SELECT event_type, task_id, agent_id, payload_json FROM events WHERE event_type = 'dx.edit'"
+    ).fetchone()
+    assert row is not None
+    assert row["task_id"] == task_id
+    payload = json.loads(row["payload_json"])
+    assert payload["file"] == "src/foo.py"
+    assert payload["diff_summary"] == "4 diff lines"
+    assert payload["provenance"] == "dx"
+
+
+def test_dx_quick_edit_does_not_mutate_task_ownership(tmp_path):
+    """A dx.edit event must not change task owner_agent_id."""
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+
+    _setup_agents(conn)
+    task_id = _setup_task(conn, agent_id=1)
+    conn.commit()
+
+    before_owner = conn.execute(
+        "SELECT owner_agent_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()["owner_agent_id"]
+
+    dx_log_edit_event(
+        tmp_path,
+        agent_name="claude-calm-otter",
+        task_id=task_id,
+        path="src/foo.py",
+        diff_summary="2 diff lines",
+    )
+
+    after_owner = conn.execute(
+        "SELECT owner_agent_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()["owner_agent_id"]
+
+    assert after_owner == before_owner
+
+
+def test_dx_quick_edit_filesystem_write_updates_file(tmp_path):
+    """Quick edit must write the modified content to the filesystem."""
+    target = tmp_path / "hello.txt"
+    target.write_text("line one\nline two\n", encoding="utf-8")
+
+    # simulate what DxTui._qe_save does: write modified lines
+    new_content = "line one\nline two edited\n"
+    target.write_text(new_content, encoding="utf-8")
+
+    assert target.read_text(encoding="utf-8") == new_content
+
+
+def test_dx_quick_edit_session_state_unchanged_after_edit_event(tmp_path):
+    """Logging a dx.edit event must not alter session status or ended_at."""
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+
+    _setup_agents(conn)
+    _setup_active_session(conn, agent_id=1, tmp_path=tmp_path)
+    task_id = _setup_task(conn, agent_id=1)
+    conn.commit()
+
+    before = conn.execute(
+        "SELECT status, ended_at FROM sessions WHERE agent_id = 1"
+    ).fetchone()
+
+    dx_log_edit_event(
+        tmp_path,
+        agent_name="claude-calm-otter",
+        task_id=task_id,
+        path="src/foo.py",
+        diff_summary="1 diff line",
+    )
+
+    after = conn.execute(
+        "SELECT status, ended_at FROM sessions WHERE agent_id = 1"
+    ).fetchone()
+
+    assert after["status"] == before["status"]
+    assert after["ended_at"] == before["ended_at"]

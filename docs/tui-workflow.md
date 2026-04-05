@@ -1,72 +1,87 @@
-# lex TUI Workflow
+# dx Workflow
 
-The preferred entrypoint for day-to-day use is:
+`dx` is the standalone live intervention layer for agent-driven development.
 
-```bash
-lx
-```
-
-When a real terminal is available, this launches the lex TUI. Otherwise lex falls back to the simpler menu shell.
-
-For the standalone dx surface, use:
+## Launching dx
 
 ```bash
 dx
 ```
 
-If the standalone script is not installed in the current dev checkout yet, use:
+Or with an explicit workspace root:
+
+```bash
+dx --root /path/to/repo
+```
+
+If the installed script is not in PATH yet, the module entrypoint works in any dev checkout:
 
 ```bash
 python3 -m lex.dx
 ```
 
-## Core Navigation
+`dx` requires an interactive terminal. It exits immediately if stdin or stdout is not a TTY.
 
-- `tab`: switch focus between the task pane and the session pane
-- `j` / `k`: move the current selection within the focused pane
-- `r`: refresh the dashboard
-- `q`: quit
+`lx` is the headless CLI surface for scripting, automation, and agent commands. It is a separate tool and does not launch `dx`.
 
-## Task Actions
+## Layout
 
-- `n`: create a task
-- `c`: claim the selected task
-- `m`: send a message on the selected task
-- `t`: change the selected task status
-- `d`: delegate a child task from the selected task
-- `f`: hand off the selected task to another agent
+`dx` shows three panels side by side:
 
-The selected-task pane shows:
+| Panel | Content |
+|---|---|
+| Agent Roster | Active agents, roster state, task title, file counts |
+| Agent Files | Files claimed or recently changed by the selected agent |
+| Workspace | Tabbed diff or file view for the currently open file |
 
-- task title and status
-- owner and delegation mode
-- recent child tasks
-- recent task-thread messages
+An action strip above the status bar shows context-sensitive actions for the focused panel.
 
-Execution note:
-- The current repo now includes a supervised worker and dispatch control plane in the CLI.
-- Worker launch approval, runtime lifecycle, and packet delivery still run through `lex worker ...` and `lex dispatch ...` commands while TUI integration catches up.
-- Session bootstrap acknowledgement, required-action completion, and watch acknowledgements currently run through `lex session ...` and `lex watch ...` commands.
+## Navigation
 
-## Session Actions
+| Key | Action |
+|---|---|
+| `tab` | Switch focus between roster → files → workspace |
+| `j` / ↓ | Move selection down |
+| `k` / ↑ | Move selection up |
+| `enter` / → | Open selected file in a workspace tab |
+| `r` | Refresh data from the database |
+| `q` / ESC | Quit |
 
-- `a`: register an agent
-- `s`: start a session
-- `h`: send a heartbeat for the selected session (selected in the session pane)
-- `x`: end the selected session (selected in the session pane)
+## Workspace Actions
 
-## Visual Warnings
+| Key | Action |
+|---|---|
+| `d` | Diff mode — show `git diff <base_ref>...HEAD` for the open file |
+| `f` | File mode — show current file contents |
+| `x` | Close the selected tab |
 
-- `!` in the task list indicates a lease that is close to expiring
-- `!` in the session list indicates a stale heartbeat or a compliance problem such as pending bootstrap, incomplete first actions, unacked subscriptions, or recorded role drift
+## Intervention Actions
 
-## Usage Notes
+| Key | Context | Action |
+|---|---|---|
+| `m` | Roster or tab focused | Prompt for a note and send it to the task thread |
+| `a` | Tab focused | Prompt for an annotation and record a `dx.annotation` event |
+| `g` | File or tab focused | Flag the current file for review (`dx.flag` event) |
 
-- The TUI operates on the same `.lex/lex.db` state as the CLI commands.
-- If another agent is active in the same repository, use lex task ownership and session state before making overlapping changes.
-- For complex root-agent-file integration, use the assisted merge workflow outside the TUI:
+## Roster States
 
-```bash
-python3 -m lex.cli merge diff
-python3 -m lex.cli merge apply
-```
+| State | Meaning |
+|---|---|
+| `active` | Agent has a task in progress with recent activity |
+| `waiting` | Agent has a task but no recent file or message activity |
+| `blocked` | Task status is `blocked` |
+| `stale` | Heartbeat older than 15 minutes, or no active session |
+| `idle` | Agent has a session but no current task |
+
+## File States
+
+| Marker | State | Meaning |
+|---|---|---|
+| `*` | `changed_unreviewed` | File appears in the agent's `git_changed_files_json` |
+| ` ` | `claimed_only` | File is claimed by the agent's task but not yet changed |
+| `!` | `conflicted` | File is claimed by more than one active task |
+
+## Invariants
+
+`dx` does not directly mutate task ownership, session lifecycle, or lease state.
+All writes go through Lex verbs: messages table, events table, and the filesystem.

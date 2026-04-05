@@ -4,7 +4,17 @@ import tomllib
 
 from lex.dashboard import load_dashboard_state
 from lex.db import connect, ensure_workspace, initialize_database
-from lex.dx.app import build_diff, build_dx_view, main
+from lex.dx.app import (
+    build_diff,
+    build_dx_view,
+    current_actions,
+    dx_flag_file,
+    dx_log_annotation,
+    dx_send_message,
+    dx_update_task_priority,
+    dx_update_task_status,
+    main,
+)
 
 
 def _setup_agent(conn, *, name="codex-brisk-otter", kind="codex", role="dev"):
@@ -119,3 +129,85 @@ def test_dx_main_requires_interactive_tty(tmp_path):
         assert "interactive terminal" in str(exc)
     else:
         raise AssertionError("expected dx main to reject non-interactive invocation")
+
+
+def test_current_actions_match_focus_contract():
+    roster_actions = [action.label for action in current_actions("roster", "diff")]
+    tab_actions = [action.label for action in current_actions("tabs", "diff")]
+
+    assert "Message Task (m)" in roster_actions
+    assert "Task Context (t)" in roster_actions
+    assert "Annotate (a)" in tab_actions
+    assert "Priority (p)" in tab_actions
+
+
+def test_dx_update_task_priority_writes_db_and_event(tmp_path):
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    agent_id = _setup_agent(conn)
+    _setup_task(conn, agent_id)
+    conn.commit()
+
+    dx_update_task_priority(tmp_path, agent_name="codex-brisk-otter", task_id=1, priority=3)
+
+    task = conn.execute("SELECT priority FROM tasks WHERE id = 1").fetchone()
+    event = conn.execute("SELECT event_type, payload_json FROM events WHERE event_type = 'task.priority_changed'").fetchone()
+
+    assert task["priority"] == 3
+    assert json.loads(event["payload_json"])["to"] == 3
+
+
+def test_dx_update_task_status_writes_db_and_event(tmp_path):
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    agent_id = _setup_agent(conn)
+    _setup_task(conn, agent_id)
+    conn.commit()
+
+    dx_update_task_status(tmp_path, agent_name="codex-brisk-otter", task_id=1, status="blocked")
+
+    task = conn.execute("SELECT status FROM tasks WHERE id = 1").fetchone()
+    event = conn.execute("SELECT event_type, payload_json FROM events WHERE event_type = 'task.status_changed'").fetchone()
+
+    assert task["status"] == "blocked"
+    assert json.loads(event["payload_json"])["to"] == "blocked"
+
+
+def test_dx_send_message_writes_task_thread_and_event(tmp_path):
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    agent_id = _setup_agent(conn)
+    _setup_task(conn, agent_id, claimed=["src/demo.py"])
+    conn.commit()
+
+    dx_send_message(tmp_path, from_agent="codex-brisk-otter", task_id=1, body="Please check edge handling")
+
+    message = conn.execute("SELECT task_id, subject, body FROM messages").fetchone()
+    event = conn.execute("SELECT event_type, payload_json FROM events WHERE event_type = 'message.sent'").fetchone()
+
+    assert message["task_id"] == 1
+    assert "edge handling" in message["body"]
+    assert json.loads(event["payload_json"])["provenance"] == "dx"
+
+
+def test_dx_annotation_and_flag_helpers_write_events(tmp_path):
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    agent_id = _setup_agent(conn)
+    _setup_task(conn, agent_id, claimed=["src/demo.py"])
+    conn.commit()
+
+    dx_log_annotation(tmp_path, agent_name="codex-brisk-otter", task_id=1, path="src/demo.py:12", note="looks risky")
+    dx_flag_file(tmp_path, agent_name="codex-brisk-otter", task_id=1, path="src/demo.py", reason="needs_review")
+
+    rows = conn.execute(
+        "SELECT event_type, payload_json FROM events WHERE event_type IN ('dx.annotation', 'dx.flag') ORDER BY id"
+    ).fetchall()
+
+    assert [row["event_type"] for row in rows] == ["dx.annotation", "dx.flag"]
+    assert json.loads(rows[0]["payload_json"])["provenance"] == "dx"
+    assert json.loads(rows[1]["payload_json"])["file"] == "src/demo.py"
