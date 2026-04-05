@@ -80,6 +80,23 @@ class TestSpawn:
         assert mgr.get_session(sid) is not None
         mgr.close(sid)
 
+    def test_failed_spawn_does_not_leak_fds(self, mgr):
+        """If Popen raises, both master_fd and slave_fd must be closed.
+
+        A failed spawn must leave the fd table at the same count as before.
+        We use /dev/fd (macOS) to count open descriptors. Because pytest itself
+        opens fds during the test, we allow the count to stay equal or decrease
+        but never increase.
+        """
+        before = len(os.listdir("/dev/fd"))
+        with pytest.raises(Exception):
+            mgr.spawn("shell", "/absolutely/no/such/executable/xyz")
+        after = len(os.listdir("/dev/fd"))
+        assert after <= before, (
+            f"fd count grew from {before} to {after}: "
+            "spawn() leaked fds on Popen failure"
+        )
+
 
 # ---------------------------------------------------------------------------
 # TerminalSession field defaults
@@ -272,8 +289,13 @@ class TestStop:
         m = PTYManager()
         m.spawn("shell", "cat")
         m.stop()
-        # _thread should be done after stop()
-        assert not m._thread.is_alive()
+        # The I/O thread must have exited within stop()'s join timeout.
+        # If this fails it means stop() returned while the thread was still
+        # running — a teardown-completeness bug.
+        assert not m._thread.is_alive(), (
+            "stop() returned but I/O thread is still alive; "
+            "join timeout may be too short or thread is stuck"
+        )
 
     def test_master_fd_cleared_after_stop(self):
         """stop() must close the master PTY fd and clear session.master_fd.

@@ -60,18 +60,27 @@ class PTYManager:
         if lex_session_id is not None:
             env["LEX_SESSION_ID"] = lex_session_id
 
-        proc = subprocess.Popen(
-            shlex.split(cmd),
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
-            cwd=cwd,
-            env=env,
-            close_fds=True,
-            start_new_session=True
-        )
+        try:
+            proc = subprocess.Popen(
+                shlex.split(cmd),
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                cwd=cwd,
+                env=env,
+                close_fds=True,
+                start_new_session=True,
+            )
+        except Exception:
+            # Popen failed before the session was registered. Neither fd has
+            # been handed off anywhere, so we must close both here. If we only
+            # closed slave_fd and re-raised, master_fd would leak permanently
+            # because stop() never sees unregistered fds.
+            os.close(master_fd)
+            os.close(slave_fd)
+            raise
 
-        # Close slave_fd in parent
+        # Close slave_fd in parent (only reached on Popen success)
         os.close(slave_fd)
 
         new_id = self._next_id
@@ -235,7 +244,7 @@ class PTYManager:
             sessions = list(self.sessions.values())
         for session in sessions:
             self._terminate_session(session)
-        self._thread.join(timeout=1.0)
+        self._thread.join(timeout=2.0)
         with self._lock:
             self.sessions.clear()
 
