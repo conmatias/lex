@@ -165,6 +165,8 @@ def read_file_contents(root: Path, path: str) -> str:
         return target.read_text(encoding="utf-8")
     except FileNotFoundError:
         return f"Missing file on disk: {path}"
+    except IsADirectoryError:
+        return f"Directory claim: {path or '.'}"
     except UnicodeDecodeError:
         return f"Binary or non-UTF-8 file: {path}"
 
@@ -462,6 +464,10 @@ class DxTui:
             self.selected_tab = max(0, min(self.selected_tab + delta, len(self.tabs) - 1))
 
     def _open_selected_file(self) -> None:
+        if self.focus == "roster":
+            self.focus = "files"
+            self.status = "select a file claim to open"
+            return
         agent = self._selected_agent_item()
         files = self._selected_files()
         if not agent or not files:
@@ -655,6 +661,9 @@ class DxTui:
             self.status = "no file selected"
             return
         target = self.root / path
+        if target.is_dir():
+            self.status = f"cannot quick-edit directory claim: {path or '.'}"
+            return
         try:
             content = target.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -842,12 +851,20 @@ class DxTui:
 
 
 def run_dx(root: Path) -> None:
-    DxTui(root).run()
+    from lex.dx.shell import run_shell
+
+    run_shell(root)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="dx")
-    parser.add_argument("--root", default=".", help="workspace root")
+    parser = argparse.ArgumentParser(
+        prog="dx",
+        description="dx — operator shell for lex multi-agent workspaces. "
+                    "Runs a full-screen TUI that shows live agent status, "
+                    "lets you route messages, review diffs, and manage tasks. "
+                    "Must be run from an interactive terminal.",
+    )
+    parser.add_argument("--root", default=".", help="workspace root (default: cwd)")
     return parser
 
 
@@ -856,5 +873,5 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     root = Path(args.root).resolve()
     if not sys.stdin.isatty() or not sys.stdout.isatty():
-        raise SystemExit("dx requires an interactive terminal; use `python -m lex.dx` or the installed `dx` script from a real TTY")
+        raise SystemExit("dx requires an interactive terminal — run it from a real TTY")
     run_dx(root)

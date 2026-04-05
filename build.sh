@@ -110,19 +110,28 @@ fi
 
 PIP_BIN="$VENV_DIR/bin/pip"
 LEX_BIN="$VENV_DIR/bin/$COMMAND_NAME"
+DX_BIN="$VENV_DIR/bin/dx"
 GLOBAL_BIN="$GLOBAL_BIN_DIR/$COMMAND_NAME"
+GLOBAL_DX_BIN="$GLOBAL_BIN_DIR/dx"
 
 run_maybe_sudo "$BUILD_ROOT" "$PIP_BIN" install --upgrade pip setuptools
 run_maybe_sudo "$BUILD_ROOT" "$PIP_BIN" install --upgrade "$MIRROR_DIR"
 run_maybe_sudo "$GLOBAL_BIN_DIR" mkdir -p "$GLOBAL_BIN_DIR"
 run_maybe_sudo "$GLOBAL_BIN_DIR" ln -sfn "$LEX_BIN" "$GLOBAL_BIN"
+run_maybe_sudo "$GLOBAL_BIN_DIR" ln -sfn "$DX_BIN" "$GLOBAL_DX_BIN"
 
 echo
-echo "lex installed into:"
+echo "lx + dx installed into:"
 echo "  $VENV_DIR"
 echo
-echo "global command:"
-echo "  $GLOBAL_BIN"
+echo "global commands:"
+echo "  $GLOBAL_BIN  — headless CLI  (agent coordination, tasks, messages)"
+echo "  $GLOBAL_DX_BIN  — operator TUI  (full-screen agent shell)"
 echo
-echo "venv entrypoint:"
+echo "venv entrypoints:"
 echo "  $LEX_BIN"
+echo "  $DX_BIN"
+echo
+echo "Quick start:"
+echo "  lx init    # initialise a new workspace in the current directory"
+echo "  dx         # open the operator shell (requires a real TTY)"
