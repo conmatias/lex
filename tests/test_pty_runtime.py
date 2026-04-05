@@ -428,3 +428,107 @@ class TestOutputTailDepth:
         # We don't assert exact count (timing), but at least some lines captured
         assert len(s.output) > 0
         mgr.close(sid)
+
+
+# ---------------------------------------------------------------------------
+# Task #41 — VT screen buffer correctness
+# ---------------------------------------------------------------------------
+
+class TestVTScreenBuffer:
+    def test_screen_initialized_on_spawn(self, mgr):
+        """Each spawned session has a pyte screen attached."""
+        import pyte
+        sid = mgr.spawn("shell", "cat")
+        s = mgr.get_session(sid)
+        assert hasattr(s, "_screen")
+        assert isinstance(s._screen, pyte.Screen)
+        assert s._screen.lines == s.rows
+        assert s._screen.columns == s.cols
+        mgr.close(sid)
+
+    def test_screen_dimensions_match_spawn_args(self, mgr):
+        sid = mgr.spawn("shell", "cat", rows=30, cols=100)
+        s = mgr.get_session(sid)
+        assert s._screen.lines == 30
+        assert s._screen.columns == 100
+        mgr.close(sid)
+
+    def test_screen_lines_returns_rows_count(self, mgr):
+        sid = mgr.spawn("shell", "cat", rows=10, cols=40)
+        s = mgr.get_session(sid)
+        lines = s.screen_lines()
+        assert len(lines) == 10
+        mgr.close(sid)
+
+    def test_vt_cursor_up_overwrites_line(self, mgr):
+        """VT cursor-up + overwrite should be reflected in screen_lines(), not appended."""
+        import pyte
+        # Build a screen directly to verify pyte semantics without real PTY timing
+        screen = pyte.Screen(40, 5)
+        stream = pyte.ByteStream(screen)
+        # Write "aaa", newline, then ESC[A (cursor up 1), ESC[K (erase line), write "bbb"
+        stream.feed(b"aaa\r\n\x1b[A\x1b[2Kbbb")
+        lines = [line.rstrip() for line in screen.display]
+        # Row 0 should be "bbb", not "aaa"
+        assert lines[0] == "bbb"
+        # "aaa" should NOT appear (it was overwritten in-place)
+        assert "aaa" not in lines
+
+    def test_screen_lines_no_screen_falls_back_to_output(self, mgr):
+        """TerminalSession without _screen returns output scrollback tail."""
+        from lex.dx.pty_runtime import TerminalSession
+        from pathlib import Path
+        s = TerminalSession(id=99, title="t", kind="shell", cwd=Path("."), rows=5, cols=10)
+        s.output = ["a", "b", "c"]
+        lines = s.screen_lines()
+        assert lines == ["a", "b", "c"]
+
+    def test_resize_updates_screen_dimensions(self, mgr):
+        sid = mgr.spawn("shell", "cat", rows=10, cols=40)
+        mgr.resize(sid, 20, 100)
+        s = mgr.get_session(sid)
+        assert s.rows == 20
+        assert s.cols == 100
+        assert s._screen.lines == 20
+        assert s._screen.columns == 100
+        mgr.close(sid)
+
+    def test_vt_color_codes_not_in_screen_text(self, mgr):
+        """screen_lines() never contains raw ANSI escape bytes."""
+        import pyte
+        screen = pyte.Screen(40, 3)
+        stream = pyte.ByteStream(screen)
+        stream.feed(b"\x1b[32mgreen text\x1b[0m")
+        lines = [line.rstrip() for line in screen.display]
+        for line in lines:
+            assert "\x1b" not in line, f"escape found in: {line!r}"
+        assert any("green text" in line for line in lines)
+
+    def test_scrollback_log_accumulates_across_screen_redraws(self, mgr):
+        """session.output scrollback should accumulate even as screen overwrites."""
+        sid = mgr.spawn("shell", "cat")
+        mgr.write(sid, "first line\n")
+        time.sleep(0.15)
+        mgr.write(sid, "second line\n")
+        time.sleep(0.15)
+        s = mgr.get_session(sid)
+        assert s is not None
+        # Both lines should appear somewhere in the scrollback
+        combined = " ".join(s.output)
+        assert "first line" in combined
+        assert "second line" in combined
+        mgr.close(sid)
+
+    def test_screen_output_via_output_tail_in_summaries(self, mgr, tmp_path):
+        """build_shell_summaries uses screen_lines() for output_tail."""
+        from lex.dx.shell import build_shell_summaries
+        import pyte
+        sid = mgr.spawn("shell", "cat", rows=5, cols=40)
+        s = mgr.get_session(sid)
+        # Manually feed text directly into the screen to simulate output
+        s._stream.feed(b"hello world\r\n")
+        summaries = build_shell_summaries(tmp_path, terminal_sessions=[s])
+        assert len(summaries) == 1
+        tail_text = " ".join(summaries[0].output_tail)
+        assert "hello world" in tail_text
+        mgr.close(sid)

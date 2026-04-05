@@ -13,12 +13,15 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Any
+
+import pyte
 
 # Matches: OSC sequences (ESC ] ... BEL), CSI sequences (ESC [ ... letter),
 # and 2-char Fe sequences (ESC @-_).  OSC must come before the Fe catch-all
 # because ']' (0x5D) falls inside the [@-_] range.  Used to strip VT/ANSI
-# codes from output before storing lines so the dx feed shows plain text.
+# codes from the scrollback log and for attention pattern matching on the
+# decoded text path.
 _ANSI_ESC = re.compile(
     r"\x1b(?:"
     r"\][^\x07\x1b]*\x07"    # OSC  — ESC ] ... BEL  (must precede Fe catch-all)
@@ -43,6 +46,7 @@ class TerminalSession:
     proc: subprocess.Popen | None = None
     master_fd: int | None = None
     status: str = "starting"
+    # Scrollback log — plain text lines accumulated over the session lifetime.
     output: list[str] = field(default_factory=list)
     unread_count: int = 0
     attention_flag: bool = False
@@ -51,6 +55,20 @@ class TerminalSession:
     agent_id: int | None = None
     rows: int = 24
     cols: int = 80
+    # VT screen buffer (set by PTYManager.spawn; None for manually-constructed
+    # sessions such as those created by FakePTYManager in tests).
+    # Not part of the dataclass __init__ — set as plain instance attributes.
+
+    def screen_lines(self) -> list[str]:
+        """Current VT screen content as plain-text lines (trailing spaces stripped).
+
+        Returns the pyte screen's display if available, otherwise falls back
+        to the scrollback tail sized to self.rows.
+        """
+        screen: pyte.Screen | None = getattr(self, "_screen", None)
+        if screen is not None:
+            return [line.rstrip() for line in screen.display]
+        return self.output[-self.rows:]
 
 
 class PTYManager:
@@ -132,6 +150,14 @@ class PTYManager:
             cols=cols,
         )
 
+        # Attach a pyte VT screen buffer. All VT control sequences (cursor
+        # movement, in-place rewrites, color) are handled here so screen_lines()
+        # always returns the current rendered state of the terminal.
+        screen = pyte.Screen(cols, rows)
+        stream = pyte.ByteStream(screen)
+        session._screen = screen  # type: ignore[attr-defined]
+        session._stream = stream  # type: ignore[attr-defined]
+
         with self._lock:
             self.sessions[new_id] = session
 
@@ -142,10 +168,10 @@ class PTYManager:
             session = self.sessions.get(session_id)
             if not session or session.master_fd is None:
                 return
-            
+
             if not text.endswith("\n"):
                 text += "\n"
-            
+
             try:
                 os.write(session.master_fd, text.encode("utf-8"))
             except OSError:
@@ -154,19 +180,12 @@ class PTYManager:
     def _io_loop(self):
         while not self._stop_event.is_set():
             with self._lock:
-                # Check for process exits
-                for sid, session in list(self.sessions.items()):
-                    if session.status == "running" and session.proc and session.proc.poll() is not None:
-                        # Process exited, but we might still have data to read
-                        # We'll mark it as exited once we hit EOF or OSError
-                        pass
-
                 fds = {s.master_fd: sid for sid, s in self.sessions.items() if s.master_fd is not None}
-            
+
             if not fds:
                 time.sleep(0.1)
                 continue
-            
+
             try:
                 readable, _, _ = select.select(list(fds.keys()), [], [], 0.1)
             except (OSError, ValueError):
@@ -178,9 +197,9 @@ class PTYManager:
             for fd in readable:
                 session_id = fds[fd]
                 try:
-                    data = os.read(fd, 4096).decode("utf-8", errors="replace")
-                    if data:
-                        self._handle_output(session_id, data)
+                    raw = os.read(fd, 4096)
+                    if raw:
+                        self._handle_output(session_id, raw)
                     else:
                         # Empty read usually means EOF
                         self._handle_exit(session_id)
@@ -188,30 +207,38 @@ class PTYManager:
                     # Session likely closed
                     self._handle_exit(session_id)
 
-    def _handle_output(self, session_id: int, data: str):
+    def _handle_output(self, session_id: int, data: bytes):
         with self._lock:
             session = self.sessions.get(session_id)
             if not session:
                 return
 
-            # Check attention patterns on raw data before stripping (escape
-            # sequences can surround the prompt text we want to detect).
-            if any(p in data for p in ["(y/n)", "> ", "input:", "? "]):
+            # Feed raw bytes to the VT screen buffer first so cursor-addressing
+            # sequences, in-place rewrites, and color attributes are applied
+            # correctly before anything tries to read screen.display.
+            stream: pyte.ByteStream | None = getattr(session, "_stream", None)
+            if stream is not None:
+                stream.feed(data)
+
+            # Decode for scrollback log and attention detection.
+            text = data.decode("utf-8", errors="replace")
+
+            # Attention detection runs on raw text (before stripping) so
+            # prompts wrapped in color codes are still detected.
+            if any(p in text for p in ["(y/n)", "> ", "input:", "? "]):
                 session.attention_flag = True
 
-            # Strip ANSI/VT escape sequences so the dx feed shows plain text.
-            clean = strip_ansi(data)
-            new_lines = [line for line in clean.splitlines() if line]
-            if not new_lines:
-                return
-            session.output.extend(new_lines)
-
-            # Limit scrollback
-            if len(session.output) > 10000:
-                session.output = session.output[-10000:]
-
-            if session.display_state == "collapsed":
-                session.unread_count += len(new_lines)
+            # Scrollback: strip escape sequences and append non-blank lines.
+            # This is intentionally separate from the VT screen — it accumulates
+            # history even as the screen overwrites its own lines.
+            clean = strip_ansi(text)
+            new_lines = [line for line in clean.splitlines() if line.strip()]
+            if new_lines:
+                session.output.extend(new_lines)
+                if len(session.output) > 10000:
+                    session.output = session.output[-10000:]
+                if session.display_state == "collapsed":
+                    session.unread_count += len(new_lines)
 
     def _handle_exit(self, session_id: int):
         with self._lock:
@@ -262,6 +289,9 @@ class PTYManager:
                 if session:
                     session.rows = rows
                     session.cols = cols
+                    screen: pyte.Screen | None = getattr(session, "_screen", None)
+                    if screen is not None:
+                        screen.resize(rows, cols)
         except OSError:
             pass
 

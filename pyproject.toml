@@ -9,6 +9,7 @@ description = "Repo-local operating layer for multi-agent coding workflows."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "pyte>=0.8.2",
     "rich>=13",
     "textual>=0.80",
 ]

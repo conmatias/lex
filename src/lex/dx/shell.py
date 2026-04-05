@@ -70,7 +70,7 @@ def build_shell_summaries(
                 runtime_session_id=session.id,
                 attention_flag=session.attention_flag,
                 unread_count=session.unread_count,
-                output_tail=tuple(session.output[-200:]),
+                output_tail=tuple(session.screen_lines()),
             )
         )
     summaries.sort(key=_slice_sort_key)
