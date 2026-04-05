@@ -26,6 +26,8 @@ class TerminalSession:
     unread_count: int = 0
     attention_flag: bool = False
     display_state: str = "expanded"  # "collapsed", "expanded"
+    active_task_id: int | None = None
+    agent_id: int | None = None
 
 
 class PTYManager:
@@ -37,15 +39,26 @@ class PTYManager:
         self._thread = threading.Thread(target=self._io_loop, daemon=True)
         self._thread.start()
 
-    def spawn(self, kind: str, cmd: str, cwd: Path | None = None) -> int:
+    def spawn(
+        self,
+        kind: str,
+        cmd: str,
+        cwd: Path | None = None,
+        lex_root: Path | None = None,
+        session_id: str | None = None,
+    ) -> int:
         cwd = cwd or Path.cwd()
         master_fd, slave_fd = pty.openpty()
-        
+
         # Set non-blocking
         os.set_blocking(master_fd, False)
 
         env = os.environ.copy()
         env["TERM"] = "xterm-256color"
+        if lex_root is not None:
+            env["LEX_ROOT"] = str(lex_root)
+        if session_id is not None:
+            env["LEX_SESSION_ID"] = session_id
         
         proc = subprocess.Popen(
             shlex.split(cmd),
@@ -138,8 +151,8 @@ class PTYManager:
             session.output.extend(new_lines)
             
             # Limit scrollback
-            if len(session.output) > 1000:
-                session.output = session.output[-1000:]
+            if len(session.output) > 10000:
+                session.output = session.output[-10000:]
             
             if session.display_state == "collapsed":
                 session.unread_count += len(new_lines)
@@ -177,6 +190,29 @@ class PTYManager:
             # Remove from registry
             if session_id in self.sessions:
                 del self.sessions[session_id]
+
+    def list_sessions(self) -> list[TerminalSession]:
+        """Return a snapshot of all active sessions."""
+        with self._lock:
+            return list(self.sessions.values())
+
+    def resize(self, session_id: int, rows: int, cols: int) -> None:
+        """Send SIGWINCH with new terminal dimensions to the session process."""
+        import fcntl
+        import struct
+        import termios
+
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if not session or session.master_fd is None:
+                return
+            fd = session.master_fd
+
+        try:
+            winsize = struct.pack("HHHH", rows, cols, 0, 0)
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
+        except OSError:
+            pass
 
     def set_display_state(self, session_id: int, state: str):
         """Update display state (e.g. 'expanded', 'collapsed')."""
