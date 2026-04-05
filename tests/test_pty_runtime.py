@@ -519,8 +519,8 @@ class TestVTScreenBuffer:
         assert "second line" in combined
         mgr.close(sid)
 
-    def test_screen_output_via_output_tail_in_summaries(self, mgr, tmp_path):
-        """build_shell_summaries uses screen_lines() for output_tail."""
+    def test_screen_output_via_screen_snapshot_in_summaries(self, mgr, tmp_path):
+        """build_shell_summaries uses screen_lines() for screen_snapshot."""
         from lex.dx.shell import build_shell_summaries
         import pyte
         sid = mgr.spawn("shell", "cat", rows=5, cols=40)
@@ -529,6 +529,6 @@ class TestVTScreenBuffer:
         s._stream.feed(b"hello world\r\n")
         summaries = build_shell_summaries(tmp_path, terminal_sessions=[s])
         assert len(summaries) == 1
-        tail_text = " ".join(summaries[0].output_tail)
+        tail_text = " ".join(summaries[0].screen_snapshot)
         assert "hello world" in tail_text
         mgr.close(sid)

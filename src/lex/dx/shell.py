@@ -25,7 +25,7 @@ class SliceSummary:
     runtime_session_id: int | None = None
     attention_flag: bool = False
     unread_count: int = 0
-    output_tail: tuple[str, ...] = ()
+    screen_snapshot: tuple[str, ...] = ()
 
 
 @dataclass
@@ -70,7 +70,7 @@ def build_shell_summaries(
                 runtime_session_id=session.id,
                 attention_flag=session.attention_flag,
                 unread_count=session.unread_count,
-                output_tail=tuple(session.screen_lines()),
+                screen_snapshot=tuple(session.screen_lines()),
             )
         )
     summaries.sort(key=_slice_sort_key)
@@ -134,7 +134,7 @@ class DxShell:
                 runtime_session_id=summary.runtime_session_id,
                 attention_flag=summary.attention_flag,
                 unread_count=summary.unread_count,
-                output_tail=summary.output_tail,
+                screen_snapshot=summary.screen_snapshot,
             )
             for summary in summaries
         ]
@@ -276,12 +276,20 @@ class DxShell:
             self.pty_manager = self._pty_manager_factory()
         return self.pty_manager
 
+    def runtime_viewport_lines(self, summary: SliceSummary, *, max_lines: int) -> list[str]:
+        if summary.source != "runtime":
+            return []
+        lines = [line.rstrip() for line in summary.screen_snapshot]
+        if not lines:
+            return ["(no terminal output yet)"]
+        return lines[-max(max_lines, 1):]
+
     def expanded_lines(self, summary: SliceSummary, *, max_lines: int) -> list[str]:
         if summary.source != "runtime":
             return [f"{summary.task_label}  {summary.detail}", "No live PTY session attached to this slice."]
         lines: list[str] = [f"{summary.task_label}  {summary.detail}"]
-        tail = list(summary.output_tail[-max(max_lines - 2, 1):]) if summary.output_tail else ["(no terminal output yet)"]
-        lines.extend(tail)
+        body_lines = self.runtime_viewport_lines(summary, max_lines=max(max_lines - 2, 1))
+        lines.extend(body_lines)
         actions = "[y] approve  [n] deny  [enter] route  [space] collapse"
         if summary.attention_flag:
             actions = "[y] approve  [n] deny  [m] prompt  [space] collapse"
