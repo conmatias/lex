@@ -255,14 +255,15 @@ class TestWrite:
         time.sleep(0.05)
         mgr.write(sid, "hello")  # must not raise
 
-    def test_write_appends_newline_if_missing(self, mgr):
-        # No assertion on output content — just verify no crash and that cat
-        # processes the input (output list non-empty after short wait).
+    def test_write_appends_carriage_return_if_missing(self, mgr):
+        # Submissions to PTY-backed coding CLIs should behave like pressing
+        # Enter, which is better represented as carriage return here.
         sid = mgr.spawn("shell", "cat")
-        mgr.write(sid, "ping")  # no trailing newline
+        mgr.write(sid, "ping")  # no trailing terminator
         time.sleep(0.15)
         s = mgr.get_session(sid)
         assert s is not None
+        assert any("ping" in line for line in s.output)
         mgr.close(sid)
 
 

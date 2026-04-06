@@ -183,8 +183,11 @@ class PTYManager:
             if not session or session.master_fd is None:
                 return
 
-            if not text.endswith("\n"):
-                text += "\n"
+            # PTY-backed coding CLIs generally expect Enter/submit semantics
+            # rather than a literal linefeed. Preserve any explicit caller
+            # terminator, otherwise send carriage return as the default submit.
+            if not text.endswith(("\r", "\n")):
+                text += "\r"
 
             try:
                 os.write(session.master_fd, text.encode("utf-8"))

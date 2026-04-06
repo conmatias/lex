@@ -250,11 +250,21 @@ class DxShell:
             self.status = f"slice {slice_id} has no PTY session"
             return
         manager = self._ensure_pty_manager()
-        manager.write(session.id, message)
+        manager.write(session.id, self._runtime_submit_payload(session, message))
         manager.set_display_state(session.id, "expanded")
         self.controller.set_expanded_slice(slice_id)
         self.status = fallback_status or f"sent to {slice_id}"
         self.refresh()
+
+    def _runtime_submit_payload(self, session: TerminalSession, message: str) -> str:
+        if not message:
+            return message
+        # Some coding CLIs use a multiline composer where the first Enter adds
+        # a newline and the second Enter submits. Fold that second press into
+        # the initial send so the main dx prompt behaves like a real submit.
+        if session.kind in {"codex", "gemini"}:
+            return f"{message}\r\r"
+        return message
 
     def _close_runtime(self, slice_id: str, *, verb: str) -> None:
         session = self._find_runtime_session(slice_id)
@@ -547,10 +557,13 @@ class DxShell:
         except curses.error:
             pass
         stdscr.keypad(True)
+        stdscr.timeout(100)
         while True:
             self.refresh()
             self.render(stdscr)
             ch = stdscr.getch()
+            if ch == -1:
+                continue
             if not self.handle_key(stdscr, ch):
                 return
 

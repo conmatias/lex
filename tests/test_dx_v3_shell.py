@@ -205,6 +205,25 @@ def test_shell_freeform_prompt_writes_to_runtime_target(tmp_path):
     shell.stop()
 
 
+def test_shell_freeform_prompt_double_submits_for_codex_and_gemini(tmp_path):
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    manager = FakePTYManager()
+
+    shell = DxShell(tmp_path, pty_manager=manager, runtime_command_builder=lambda kind: f"run-{kind}")
+    shell.submit_prompt("/spawn codex")
+    shell.submit_prompt("continue")
+    shell.submit_prompt("/spawn gemini")
+    shell.submit_prompt("keep going")
+
+    assert manager.writes == [
+        (1, "continue\r\r"),
+        (2, "keep going\r\r"),
+    ]
+    shell.stop()
+
+
 def test_shell_expanded_lines_render_runtime_output_and_actions(tmp_path):
     paths = ensure_workspace(tmp_path)
     conn = connect(paths.db_path)
