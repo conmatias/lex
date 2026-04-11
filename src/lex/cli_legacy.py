@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import argparse
 import curses
+import getpass
+import hashlib
+import json
 import os
+import re
+import signal
+import sqlite3
+import socket
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Sequence
+from typing import Callable, Sequence
 
-<<<<<<< HEAD
 from lex.coordination import (
     WORKER_RUNTIME_STALE_MINUTES,
     capture_git_snapshot,
@@ -34,17 +41,16 @@ from lex.coordination import (
     retire_agent,
     release_stale_leases,
 )
-from lex.db import BUILTIN_SPECIALTIES, connect, derive_event_provenance, detect_path_conflicts, ensure_workspace, fetch_one, find_lex_root, initialize_database, list_specialties, log_event, resolve_paths, run_roster_preflight
+from lex.dx import run_dx
+from lex.discovery import LexDiscovery
+from lex.db import BUILTIN_SPECIALTIES, close_connections_since, connect, connection_checkpoint, derive_event_provenance, detect_path_conflicts, ensure_workspace, fetch_one, find_lex_root, initialize_database, list_specialties, log_event, resolve_paths, run_roster_preflight
 from lex.dispatch import (
     VALID_WORKER_APPROVAL_POLICIES,
     command_preview,
     decode_json_list,
     decode_json_object,
-    launch_worker_supervisor,
     should_require_packet_approval,
     should_require_runtime_approval,
-    stop_runtime_process,
-    worker_runtime_dir,
 )
 from lex.installer import InstallContext, inspect_install_context, install_scaffold
 from lex.merge_workflow import apply_proposal, create_merge_packet, resolve_merge_paths, unified_diff
@@ -61,17 +67,62 @@ from lex.rich_output import (
     render_task_message_rows,
     render_task_show,
 )
-=======
-import lex.cli_legacy as legacy
-from lex.db import close_connections_since, connection_checkpoint
->>>>>>> 8ed20f4 (refactor(core): split cli.py into modular commands and services, improve worker runtime and git awareness)
 from lex.tui import run_tui
+from lex.runtime.service import deliver_packet, start_runtime, stop_runtime
 
-CLI_COMMAND = legacy.CLI_COMMAND
-run_dx = legacy.run_dx
+CLI_COMMAND = "lx"
 
+AGENT_NAME_RE = re.compile(r"^(codex|claude|cursor|gemini|ci|automated)-[a-z]+-[a-z]+$")
+AGENT_ADJECTIVES = (
+    "brisk",
+    "calm",
+    "clear",
+    "eager",
+    "keen",
+    "nimble",
+    "quiet",
+    "sharp",
+    "steady",
+    "swift",
+)
+AGENT_NOUNS = (
+    "badger",
+    "falcon",
+    "heron",
+    "ibis",
+    "lynx",
+    "otter",
+    "raven",
+    "sparrow",
+    "stoat",
+    "wren",
+)
+CANONICAL_AGENT_ROLES = {"dev", "pm", "auditor", "infra"}
+VALID_TASK_STATES = {
+    "open",
+    "claimed",
+    "in_progress",
+    "blocked",
+    "review_requested",
+    "handoff_pending",
+    "done",
+    "abandoned",
+}
+VALID_MESSAGE_TYPES = {
+    "note",
+    "question",
+    "answer",
+    "blocker",
+    "handoff",
+    "review_request",
+    "review_result",
+    "decision",
+    "artifact_notice",
+}
+VALID_RUNTIME_APPROVAL_STATUSES = {"pending_approval", "approved", "rejected", "not_required"}
+VALID_RUNTIME_STOP_SIGNALS = {"TERM": signal.SIGTERM, "KILL": signal.SIGKILL, "INT": signal.SIGINT}
+VALID_PACKET_APPROVAL_STATUSES = {"pending_approval", "approved", "rejected", "not_required"}
 
-<<<<<<< HEAD
 
 def emit_json(data: object) -> None:
     print(json.dumps(data, indent=2, sort_keys=True))
@@ -1915,27 +1966,7 @@ def cmd_worker_start(args: argparse.Namespace) -> None:
     conn = connect(paths.db_path)
     initialize_database(conn)
     enforce_roster_preflight(conn)
-    runtime = get_worker_runtime(conn, args.runtime_id)
-    if runtime["approval_required"] and runtime["approval_status"] != "approved":
-        raise SystemExit("runtime requires human approval before start")
-    if runtime["status"] in {"launching", "running"}:
-        raise SystemExit(f"runtime {args.runtime_id} is already {runtime['status']}")
-    conn.execute(
-        "UPDATE worker_runtimes SET status = 'launching', heartbeat_at = CURRENT_TIMESTAMP WHERE id = ?",
-        (args.runtime_id,),
-    )
-    supervisor = launch_worker_supervisor(paths, args.runtime_id)
-    conn.execute(
-        "UPDATE worker_runtimes SET supervisor_pid = ? WHERE id = ?",
-        (supervisor.pid, args.runtime_id),
-    )
-    log_event(
-        conn,
-        "worker.runtime_launching",
-        task_id=runtime["task_id"],
-        agent_id=runtime["requested_by_agent_id"],
-        payload={"runtime_id": args.runtime_id, "worker_name": runtime["worker_name"]},
-    )
+    start_runtime(conn, paths=paths, runtime_id=args.runtime_id)
     conn.commit()
     print_ok(f"started worker runtime {args.runtime_id}")
 
@@ -1944,30 +1975,7 @@ def cmd_worker_stop(args: argparse.Namespace) -> None:
     paths = resolve_paths(args.root)
     conn = connect(paths.db_path)
     initialize_database(conn)
-    runtime = get_worker_runtime(conn, args.runtime_id)
-    target_pid = runtime["child_pid"] or runtime["pid"] or runtime["supervisor_pid"]
-    if target_pid is not None:
-        try:
-            stop_runtime_process(target_pid, VALID_RUNTIME_STOP_SIGNALS[args.signal])
-        except ProcessLookupError:
-            pass
-    conn.execute(
-        """
-        UPDATE worker_runtimes
-        SET status = 'stopped',
-            heartbeat_at = CURRENT_TIMESTAMP,
-            ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP)
-        WHERE id = ?
-        """,
-        (args.runtime_id,),
-    )
-    log_event(
-        conn,
-        "worker.runtime_stopped",
-        task_id=runtime["task_id"],
-        agent_id=runtime["requested_by_agent_id"],
-        payload={"runtime_id": args.runtime_id, "signal": args.signal},
-    )
+    stop_runtime(conn, runtime_id=args.runtime_id, sig=VALID_RUNTIME_STOP_SIGNALS[args.signal], signal_name=args.signal)
     conn.commit()
     print_ok(f"stopped worker runtime {args.runtime_id}")
 
@@ -2154,63 +2162,9 @@ def cmd_dispatch_send(args: argparse.Namespace) -> None:
     conn = connect(paths.db_path)
     initialize_database(conn)
     cleanup_stale_worker_runtimes(conn)
-    packet = get_dispatch_packet(conn, args.packet_id)
-    if packet["requires_human_approval"] and packet["approval_status"] != "approved":
-        raise SystemExit("dispatch packet requires human approval before delivery")
-    runtime = get_worker_runtime(conn, args.runtime_id) if args.runtime_id else None
-    if runtime is None:
-        runtime = fetch_one(
-            conn,
-            """
-            SELECT
-                wr.*,
-                wd.name AS worker_name,
-                wd.kind AS worker_kind,
-                wd.role AS worker_role,
-                wd.specialty AS worker_specialty
-            FROM worker_runtimes wr
-            JOIN worker_definitions wd ON wd.id = wr.worker_id
-            WHERE wr.worker_id = ? AND wr.status IN ('approved', 'launching', 'running')
-            ORDER BY wr.id DESC
-            LIMIT 1
-            """,
-            (packet["to_worker_id"],),
-        )
-    if runtime is None:
-        raise SystemExit("no running worker runtime available for packet delivery")
-    if runtime["status"] not in {"approved", "launching", "running"}:
-        raise SystemExit(f"worker runtime {runtime['id']} is not accepting packets")
-    runtime_dir = worker_runtime_dir(paths, runtime["id"])
-    inbox_path = Path(runtime["inbox_path"] or runtime_dir / "inbox")
-    inbox_path.mkdir(parents=True, exist_ok=True)
-    packet_path = inbox_path / f"packet-{args.packet_id}.json"
-    payload = {
-        "id": args.packet_id,
-        "task_id": packet["task_id"],
-        "from_agent": packet["from_agent_name"],
-        "to_worker": runtime["worker_name"],
-        "sensitive_action": packet["sensitive_action"],
-        "created_at": packet["created_at"],
-        "packet": json.loads(packet["packet_json"]),
-    }
-    packet_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    conn.execute(
-        """
-        UPDATE dispatch_packets
-        SET runtime_id = ?, delivery_path = ?, delivery_status = 'delivered', delivered_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-        """,
-        (runtime["id"], str(packet_path), args.packet_id),
-    )
-    log_event(
-        conn,
-        "dispatch.packet_delivered",
-        task_id=packet["task_id"],
-        agent_id=packet["from_agent_id"],
-        payload={"packet_id": args.packet_id, "runtime_id": runtime["id"], "path": str(packet_path)},
-    )
+    runtime_id, _ = deliver_packet(conn, paths=paths, packet_id=args.packet_id, runtime_id=args.runtime_id)
     conn.commit()
-    print_ok(f"delivered packet {args.packet_id} to runtime {runtime['id']}")
+    print_ok(f"delivered packet {args.packet_id} to runtime {runtime_id}")
 
 
 def cmd_dispatch_ack(args: argparse.Namespace) -> None:
@@ -2615,23 +2569,75 @@ def cmd_event_list(args: argparse.Namespace) -> None:
     )
 
 
-def add_follow_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--since-id", type=int)
-    parser.add_argument("--follow", action="store_true")
-    parser.add_argument("--poll-interval", type=float, default=2.0)
-    parser.add_argument("--max-polls", type=int)
-=======
-def __getattr__(name: str):
-    return getattr(legacy, name)
+def cmd_discover(args: argparse.Namespace) -> None:
+    print_info("listening for nearby Lex peers...")
+    discovery = LexDiscovery()
+    
+    peers = []
+    def on_peer(peer):
+        print(f"  found peer: {peer.agent_name:<20} | branch: {peer.git_branch or '-':<15} | root: {peer.root_path}")
+        peers.append(peer)
+
+    discovery.listen(timeout=args.timeout, callback=on_peer)
+    
+    if not peers:
+        print("no peers discovered")
+
+
+def cmd_discovery_announce(args: argparse.Namespace) -> None:
+    paths = resolve_paths(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    
+    # Try to find an active session to announce
+    session = None
+    if args.session_id:
+        session = get_session(conn, args.session_id)
+    else:
+        # Just pick the most recent active session
+        session = conn.execute(
+            """
+            SELECT s.id, a.name AS agent_name, s.git_branch, s.git_base_ref
+            FROM sessions s
+            JOIN agents a ON a.id = s.agent_id
+            WHERE s.status = 'active' AND s.ended_at IS NULL
+            ORDER BY s.id DESC LIMIT 1
+            """
+        ).fetchone()
+    
+    if not session:
+        print_info("no active session found to announce, announcing as generic peer")
+        payload = {
+            "agent_name": "anonymous",
+            "root_path": str(paths.root)
+        }
+    else:
+        payload = {
+            "agent_name": session["agent_name"],
+            "session_id": session["id"],
+            "git_branch": session["git_branch"],
+            "git_base_ref": session["git_base_ref"],
+            "root_path": str(paths.root)
+        }
+    
+    print_ok(f"announcing as {payload['agent_name']} (press Ctrl+C to stop)")
+    discovery = LexDiscovery(payload)
+    discovery.start_announcing(interval=args.interval)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nstopped announcement")
 
 
 def cmd_dx(args: argparse.Namespace) -> None:
     root = Path(args.root).resolve()
+    paths = resolve_paths(root)
+
+    # Optionally announce this dx session on the LAN if a workspace DB exists.
     discovery = None
-    if getattr(args, "announce", False):
-        paths = legacy.resolve_paths(root)
-        conn = legacy.connect(paths.db_path)
-        legacy.initialize_database(conn)
+    if paths.db_path.exists():
+        conn = connect(paths.db_path)
         session = conn.execute(
             "SELECT s.id, a.name AS agent_name, s.git_branch, s.git_base_ref "
             "FROM sessions s JOIN agents a ON a.id = s.agent_id "
@@ -2639,15 +2645,13 @@ def cmd_dx(args: argparse.Namespace) -> None:
             "ORDER BY s.id DESC LIMIT 1"
         ).fetchone()
         if session:
-            discovery = legacy.LexDiscovery(
-                {
-                    "agent_name": session["agent_name"],
-                    "session_id": session["id"],
-                    "git_branch": session["git_branch"],
-                    "git_base_ref": session["git_base_ref"],
-                    "root_path": str(root),
-                }
-            )
+            discovery = LexDiscovery({
+                "agent_name": session["agent_name"],
+                "session_id": session["id"],
+                "git_branch": session["git_branch"],
+                "git_base_ref": session["git_base_ref"],
+                "root_path": str(root),
+            })
             discovery.start_announcing()
 
     try:
@@ -2655,385 +2659,19 @@ def cmd_dx(args: argparse.Namespace) -> None:
     finally:
         if discovery:
             discovery.stop()
->>>>>>> 8ed20f4 (refactor(core): split cli.py into modular commands and services, improve worker runtime and git awareness)
+
+
+def add_follow_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--since-id", type=int)
+    parser.add_argument("--follow", action="store_true")
+    parser.add_argument("--poll-interval", type=float, default=2.0)
+    parser.add_argument("--max-polls", type=int)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=CLI_COMMAND)
     parser.add_argument("--root", default=".", help="workspace root")
     subparsers = parser.add_subparsers(dest="command")
-
-<<<<<<< HEAD
-    init_parser = subparsers.add_parser("init")
-    init_parser.set_defaults(func=cmd_init)
-
-    install_parser = subparsers.add_parser("install")
-    install_parser.add_argument("--agent-files", choices=["preserve", "merge", "assisted", "overwrite"], default="merge")
-    install_parser.add_argument("--ignore-policy", choices=["none", "runtime", "all"], default="runtime")
-    install_parser.add_argument("--ignore-target", choices=["gitignore", "local-exclude"], default="gitignore")
-    install_parser.add_argument("--assisted-agent", choices=["codex", "claude", "gemini", "manual"], default="codex")
-    install_parser.add_argument("--non-interactive", action="store_true")
-    install_parser.set_defaults(func=cmd_install)
-
-    merge_parser = subparsers.add_parser("merge")
-    merge_sub = merge_parser.add_subparsers(dest="merge_command", required=True)
-
-    merge_plan = merge_sub.add_parser("plan")
-    merge_plan.add_argument("--agent", choices=["codex", "claude", "gemini", "manual"], default="codex")
-    merge_plan.set_defaults(func=cmd_merge_plan)
-
-    merge_diff = merge_sub.add_parser("diff")
-    merge_diff.set_defaults(func=cmd_merge_diff)
-
-    merge_apply = merge_sub.add_parser("apply")
-    merge_apply.set_defaults(func=cmd_merge_apply)
-
-    agent_parser = subparsers.add_parser("agent")
-    agent_sub = agent_parser.add_subparsers(dest="agent_command", required=True)
-
-    agent_identify = agent_sub.add_parser("identify")
-    agent_identify.add_argument("kind", choices=["codex", "claude", "cursor", "gemini", "ci", "automated"])
-    agent_identify.add_argument("--name")
-    agent_identify.add_argument("--role")
-    agent_identify.add_argument("--specialty")
-    agent_identify.add_argument("--json", action="store_true")
-    agent_identify.set_defaults(func=cmd_agent_identify)
-
-    agent_register = agent_sub.add_parser("register")
-    agent_register.add_argument("name")
-    agent_register.add_argument("kind", choices=["codex", "claude", "cursor", "gemini", "ci", "automated"])
-    agent_register.add_argument("--role")
-    agent_register.add_argument("--specialty")
-    agent_register.set_defaults(func=cmd_agent_register)
-
-    agent_role = agent_sub.add_parser("role")
-    agent_role.add_argument("agent")
-    agent_role.add_argument("role")
-    agent_role.add_argument("--specialty")
-    agent_role.set_defaults(func=cmd_agent_update_role)
-
-    specialty_parser = subparsers.add_parser("specialty")
-    specialty_sub = specialty_parser.add_subparsers(dest="specialty_command", required=True)
-
-    specialty_add = specialty_sub.add_parser("add")
-    specialty_add.add_argument("name")
-    specialty_add.set_defaults(func=cmd_specialty_add)
-
-    specialty_list = specialty_sub.add_parser("list")
-    specialty_list.add_argument("--json", action="store_true")
-    specialty_list.set_defaults(func=cmd_specialty_list)
-
-    agent_list = agent_sub.add_parser("list")
-    agent_list.add_argument("--json", action="store_true")
-    agent_list.set_defaults(func=cmd_agent_list)
-
-    agent_preflight = agent_sub.add_parser("preflight")
-    agent_preflight.add_argument("--json", action="store_true")
-    agent_preflight.set_defaults(func=cmd_agent_preflight)
-
-    agent_retire = agent_sub.add_parser("retire")
-    agent_retire.add_argument("agent")
-    agent_retire.add_argument("--by", help="agent performing the retirement (for audit)")
-    agent_retire.add_argument("--force", action="store_true", help="retire even if agent owns active tasks")
-    agent_retire.set_defaults(func=cmd_agent_retire)
-
-    session_parser = subparsers.add_parser("session")
-    session_sub = session_parser.add_subparsers(dest="session_command", required=True)
-
-    session_start = session_sub.add_parser("start")
-    session_start.add_argument("agent")
-    session_start.add_argument("--label")
-    session_start.add_argument("--cwd", default=".")
-    session_start.add_argument("--capability", action="append")
-    session_start.add_argument("--fingerprint")
-    session_start.add_argument("--fingerprint-label")
-    session_start.set_defaults(func=cmd_session_start)
-
-    session_heartbeat = session_sub.add_parser("heartbeat")
-    session_heartbeat.add_argument("session_id", type=int)
-    session_heartbeat.set_defaults(func=cmd_session_heartbeat)
-
-    session_end = session_sub.add_parser("end")
-    session_end.add_argument("session_id", type=int)
-    session_end.set_defaults(func=cmd_session_end)
-
-    session_bootstrap_show = session_sub.add_parser("bootstrap-show")
-    session_bootstrap_show.add_argument("session_id", type=int)
-    session_bootstrap_show.add_argument("--json", action="store_true")
-    session_bootstrap_show.set_defaults(func=cmd_session_bootstrap_show)
-
-    session_bootstrap_ack = session_sub.add_parser("bootstrap-ack")
-    session_bootstrap_ack.add_argument("session_id", type=int)
-    session_bootstrap_ack.add_argument("--by", required=True)
-    session_bootstrap_ack.set_defaults(func=cmd_session_bootstrap_ack)
-
-    session_action = session_sub.add_parser("action")
-    session_action.add_argument("session_id", type=int)
-    session_action.add_argument("action_key")
-    session_action.add_argument("--note")
-    session_action.set_defaults(func=cmd_session_action_complete)
-
-    session_list = session_sub.add_parser("list")
-    session_list.add_argument("--active-only", action="store_true")
-    session_list.add_argument("--json", action="store_true")
-    session_list.set_defaults(func=cmd_session_list)
-
-    worker_parser = subparsers.add_parser("worker")
-    worker_sub = worker_parser.add_subparsers(dest="worker_command", required=True)
-
-    worker_register = worker_sub.add_parser("register")
-    worker_register.add_argument("name")
-    worker_register.add_argument("kind", choices=["codex", "claude", "cursor", "gemini", "ci", "automated"])
-    worker_register.add_argument("--role")
-    worker_register.add_argument("--specialty")
-    worker_register.add_argument("--command-json", required=True)
-    worker_register.add_argument("--env-json", default="{}")
-    worker_register.add_argument("--cwd")
-    worker_register.add_argument("--approval-policy", choices=list(VALID_WORKER_APPROVAL_POLICIES), default="always")
-    worker_register.add_argument("--created-by")
-    worker_register.set_defaults(func=cmd_worker_register)
-
-    worker_list = worker_sub.add_parser("list")
-    worker_list.add_argument("--json", action="store_true")
-    worker_list.set_defaults(func=cmd_worker_list)
-
-    worker_runtime_list = worker_sub.add_parser("runtime-list")
-    worker_runtime_list.add_argument("--json", action="store_true")
-    worker_runtime_list.set_defaults(func=cmd_worker_runtime_list)
-
-    worker_cleanup = worker_sub.add_parser("cleanup")
-    worker_cleanup.add_argument("--stale-minutes", type=int, default=WORKER_RUNTIME_STALE_MINUTES)
-    worker_cleanup.add_argument("--json", action="store_true")
-    worker_cleanup.set_defaults(func=cmd_worker_cleanup)
-
-    worker_request = worker_sub.add_parser("request-start")
-    worker_request.add_argument("worker")
-    worker_request.add_argument("--requested-by", required=True)
-    worker_request.add_argument("--task-id", type=int)
-    worker_request.add_argument("--reason")
-    worker_request.add_argument("--sensitive-action")
-    worker_request.add_argument("--cwd")
-    worker_request.add_argument("--approved-by")
-    worker_request.set_defaults(func=cmd_worker_request_start)
-
-    worker_approve = worker_sub.add_parser("approve")
-    worker_approve.add_argument("runtime_id", type=int)
-    worker_approve.add_argument("decision", choices=["approved", "rejected"])
-    worker_approve.add_argument("--approved-by", required=True)
-    worker_approve.set_defaults(func=cmd_worker_approve)
-
-    worker_start = worker_sub.add_parser("start")
-    worker_start.add_argument("runtime_id", type=int)
-    worker_start.set_defaults(func=cmd_worker_start)
-
-    worker_stop = worker_sub.add_parser("stop")
-    worker_stop.add_argument("runtime_id", type=int)
-    worker_stop.add_argument("--signal", choices=sorted(VALID_RUNTIME_STOP_SIGNALS), default="TERM")
-    worker_stop.set_defaults(func=cmd_worker_stop)
-
-    task_parser = subparsers.add_parser("task")
-    task_sub = task_parser.add_subparsers(dest="task_command", required=True)
-
-    task_create = task_sub.add_parser("create")
-    task_create.add_argument("title")
-    task_create.add_argument("--slug")
-    task_create.add_argument("--description")
-    task_create.add_argument("--priority", type=int, default=2)
-    task_create.add_argument("--created-by")
-    task_create.add_argument("--parent-task", type=int)
-    task_create.add_argument("--delegation-mode", default="direct", choices=["direct", "hypervisor"])
-    task_create.add_argument("--path", action="append")
-    task_create.add_argument("--force-role-override", action="store_true")
-    task_create.set_defaults(func=cmd_task_create)
-
-    task_list = task_sub.add_parser("list")
-    task_list.add_argument("--json", action="store_true")
-    task_list.set_defaults(func=cmd_task_list)
-
-    task_show = task_sub.add_parser("show")
-    task_show.add_argument("task_id", type=int)
-    task_show.add_argument("--agent")
-    task_show.add_argument("--json", action="store_true")
-    task_show.set_defaults(func=cmd_task_show)
-
-    task_claim = task_sub.add_parser("claim")
-    task_claim.add_argument("task_id", type=int)
-    task_claim.add_argument("agent")
-    task_claim.add_argument("--ttl-minutes", type=int, default=30)
-    task_claim.add_argument("--force-role-override", action="store_true")
-    task_claim.add_argument("--strict", action="store_true", help="block claim on path conflict instead of warning")
-    task_claim.set_defaults(func=cmd_task_claim)
-
-    task_priority = task_sub.add_parser("priority")
-    task_priority.add_argument("task_id", type=int)
-    task_priority.add_argument("agent")
-    task_priority.add_argument("priority", type=int)
-    task_priority.add_argument("--force-role-override", action="store_true")
-    task_priority.set_defaults(func=cmd_task_update_priority)
-
-    task_delegate = task_sub.add_parser("delegate")
-    task_delegate.add_argument("parent_task_id", type=int)
-    task_delegate.add_argument("owner_agent")
-    task_delegate.add_argument("assignee_agent")
-    task_delegate.add_argument("title")
-    task_delegate.add_argument("--slug")
-    task_delegate.add_argument("--description")
-    task_delegate.add_argument("--subject")
-    task_delegate.add_argument("--body", required=True)
-    task_delegate.add_argument("--priority", type=int)
-    task_delegate.add_argument("--ttl-minutes", type=int, default=30)
-    task_delegate.add_argument("--path", action="append")
-    task_delegate.add_argument("--force-role-override", action="store_true")
-    task_delegate.set_defaults(func=cmd_task_delegate)
-
-    task_status = task_sub.add_parser("status")
-    task_status.add_argument("task_id", type=int)
-    task_status.add_argument("agent")
-    task_status.add_argument("status")
-    task_status.add_argument("--force-role-override", action="store_true")
-    task_status.set_defaults(func=cmd_task_update_status)
-
-    task_handoff = task_sub.add_parser("handoff")
-    task_handoff.add_argument("task_id", type=int)
-    task_handoff.add_argument("from_agent")
-    task_handoff.add_argument("to_agent")
-    task_handoff.add_argument("--subject")
-    task_handoff.add_argument("--body", required=True)
-    task_handoff.add_argument("--force-role-override", action="store_true")
-    task_handoff.set_defaults(func=cmd_task_handoff)
-
-    lease_parser = subparsers.add_parser("lease")
-    lease_sub = lease_parser.add_subparsers(dest="lease_command", required=True)
-    lease_renew = lease_sub.add_parser("renew")
-    lease_renew.add_argument("task_id", type=int)
-    lease_renew.add_argument("agent")
-    lease_renew.add_argument("--ttl-minutes", type=int, default=30)
-    lease_renew.set_defaults(func=cmd_lease_renew)
-
-    msg_parser = subparsers.add_parser("msg")
-    msg_sub = msg_parser.add_subparsers(dest="msg_command", required=True)
-
-    msg_send = msg_sub.add_parser("send")
-    msg_send.add_argument("--task", dest="task_id", type=int)
-    msg_send.add_argument("--from", dest="from_agent", required=True)
-    msg_send.add_argument("--to", dest="to_agent")
-    msg_send.add_argument("--type", required=True)
-    msg_send.add_argument("--subject")
-    msg_send.add_argument("--body", required=True)
-    msg_send.set_defaults(func=cmd_msg_send)
-
-    msg_inbox = msg_sub.add_parser("inbox")
-    msg_inbox.add_argument("agent")
-    msg_inbox.add_argument("--limit", type=int, default=20)
-    msg_inbox.add_argument("--json", action="store_true")
-    add_follow_arguments(msg_inbox)
-    msg_inbox.set_defaults(func=cmd_msg_inbox)
-
-    msg_task = msg_sub.add_parser("task")
-    msg_task.add_argument("task_id", type=int)
-    msg_task.add_argument("--limit", type=int, default=20)
-    msg_task.add_argument("--json", action="store_true")
-    add_follow_arguments(msg_task)
-    msg_task.set_defaults(func=cmd_msg_task)
-
-    watch_parser = subparsers.add_parser("watch")
-    watch_sub = watch_parser.add_subparsers(dest="watch_command", required=True)
-
-    watch_add = watch_sub.add_parser("add")
-    watch_add.add_argument("agent")
-    watch_add.add_argument("task_id", type=int)
-    watch_add.add_argument("--force-role-override", action="store_true")
-    watch_add.set_defaults(func=cmd_watch_add)
-
-    watch_list = watch_sub.add_parser("list")
-    watch_list.add_argument("--agent")
-    watch_list.add_argument("--json", action="store_true")
-    watch_list.set_defaults(func=cmd_watch_list)
-
-    watch_ack = watch_sub.add_parser("ack")
-    watch_ack.add_argument("agent")
-    watch_ack.add_argument("task_id", type=int)
-    watch_ack.add_argument("--event-id", type=int)
-    watch_ack.set_defaults(func=cmd_watch_ack)
-
-    dispatch_parser = subparsers.add_parser("dispatch")
-    dispatch_sub = dispatch_parser.add_subparsers(dest="dispatch_command", required=True)
-
-    dispatch_create = dispatch_sub.add_parser("create")
-    dispatch_create.add_argument("--task-id", type=int)
-    dispatch_create.add_argument("--from", dest="from_agent", required=True)
-    dispatch_create.add_argument("--to-worker", required=True)
-    dispatch_create.add_argument("--summary", required=True)
-    dispatch_create.add_argument("--body", required=True)
-    dispatch_create.add_argument("--artifact", action="append")
-    dispatch_create.add_argument("--metadata-json", default="{}")
-    dispatch_create.add_argument("--sensitive-action")
-    dispatch_create.add_argument("--require-approval", action="store_true")
-    dispatch_create.add_argument("--approved-by")
-    dispatch_create.set_defaults(func=cmd_dispatch_create)
-
-    dispatch_list = dispatch_sub.add_parser("list")
-    dispatch_list.add_argument("--json", action="store_true")
-    dispatch_list.set_defaults(func=cmd_dispatch_list)
-
-    dispatch_approve = dispatch_sub.add_parser("approve")
-    dispatch_approve.add_argument("packet_id", type=int)
-    dispatch_approve.add_argument("decision", choices=["approved", "rejected"])
-    dispatch_approve.add_argument("--approved-by", required=True)
-    dispatch_approve.set_defaults(func=cmd_dispatch_approve)
-
-    dispatch_send = dispatch_sub.add_parser("send")
-    dispatch_send.add_argument("packet_id", type=int)
-    dispatch_send.add_argument("--runtime-id", type=int)
-    dispatch_send.set_defaults(func=cmd_dispatch_send)
-
-    dispatch_ack = dispatch_sub.add_parser("ack")
-    dispatch_ack.add_argument("packet_id", type=int)
-    dispatch_ack.add_argument("--runtime-id", type=int)
-    dispatch_ack.add_argument("--note")
-    dispatch_ack.set_defaults(func=cmd_dispatch_ack)
-
-    dispatch_complete = dispatch_sub.add_parser("complete")
-    dispatch_complete.add_argument("packet_id", type=int)
-    dispatch_complete.add_argument("status", choices=["completed", "failed", "cancelled"])
-    dispatch_complete.add_argument("--note")
-    dispatch_complete.set_defaults(func=cmd_dispatch_complete)
-
-    prompt_parser = subparsers.add_parser("prompt")
-    prompt_sub = prompt_parser.add_subparsers(dest="prompt_command", required=True)
-
-    prompt_create = prompt_sub.add_parser("create")
-    prompt_create.add_argument("--role", required=True)
-    prompt_create.add_argument("--agent", default=None, help="agent name to hydrate with live state")
-    prompt_create.add_argument("--json", action="store_true")
-    prompt_create.set_defaults(func=cmd_prompt_create)
-
-    event_parser = subparsers.add_parser("event")
-    event_sub = event_parser.add_subparsers(dest="event_command", required=True)
-
-    event_list = event_sub.add_parser("list")
-    event_list.add_argument("--task", dest="task_id", type=int)
-    event_list.add_argument("--agent")
-    event_list.add_argument("--limit", type=int, default=20)
-    event_list.add_argument("--json", action="store_true")
-    add_follow_arguments(event_list)
-    event_list.set_defaults(func=cmd_event_list)
-
-    hook_parser = subparsers.add_parser("hook")
-    hook_sub = hook_parser.add_subparsers(dest="hook_command", required=True)
-
-    claude_parser = hook_sub.add_parser("claude")
-    claude_sub = claude_parser.add_subparsers(dest="claude_hook_command", required=True)
-
-    claude_stop = claude_sub.add_parser("stop")
-    claude_stop.set_defaults(func=cmd_hook_claude_stop)
-
-    claude_upr = claude_sub.add_parser("user-prompt-submit")
-    claude_upr.set_defaults(func=cmd_hook_claude_user_prompt_submit)
-
-    claude_ptu = claude_sub.add_parser("post-tool-use")
-    claude_ptu.set_defaults(func=cmd_hook_claude_post_tool_use)
-=======
     from lex.commands import agent as agent_commands
     from lex.commands import dispatch as dispatch_commands
     from lex.commands import dx as dx_commands
@@ -3047,9 +2685,7 @@ def build_parser() -> argparse.ArgumentParser:
     from lex.commands import watch as watch_commands
     from lex.commands import worker as worker_commands
 
-    ctx_data = dict(vars(legacy))
-    ctx_data["cmd_dx"] = cmd_dx
-    ctx = SimpleNamespace(**ctx_data)
+    ctx = SimpleNamespace(**globals())
 
     install_commands.attach(subparsers, ctx=ctx)
     agent_commands.attach(subparsers, ctx=ctx)
@@ -3063,7 +2699,6 @@ def build_parser() -> argparse.ArgumentParser:
     event_commands.attach(subparsers, ctx=ctx)
     dx_commands.attach(subparsers, ctx=ctx)
     hook_commands.attach(subparsers, ctx=ctx)
->>>>>>> 8ed20f4 (refactor(core): split cli.py into modular commands and services, improve worker runtime and git awareness)
 
     return parser
 
@@ -3071,26 +2706,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-<<<<<<< HEAD
-    if args.command is None:
-        root = Path(args.root).resolve()
-        if sys.stdin.isatty() and sys.stdout.isatty():
-            try:
-                run_tui(root)
-            except Exception as exc:
-                if os.environ.get("LEX_DEBUG_TUI") == "1":
-                    raise
-                reason = f"{type(exc).__name__}: {exc}"
-                if isinstance(exc, curses.error):
-                    print(f"{CLI_COMMAND}: TUI unavailable, falling back to interactive shell ({reason})", file=sys.stderr)
-                else:
-                    print(f"{CLI_COMMAND}: TUI failed to start, falling back to interactive shell ({reason})", file=sys.stderr)
-                run_interactive_shell(root)
-        else:
-            run_interactive_shell(root)
-        return
-    args.func(args)
-=======
     checkpoint = connection_checkpoint()
     try:
         if args.command is None:
@@ -3103,23 +2718,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                         raise
                     reason = f"{type(exc).__name__}: {exc}"
                     if isinstance(exc, curses.error):
-                        print(
-                            f"{CLI_COMMAND}: TUI unavailable, falling back to interactive shell ({reason})",
-                            file=sys.stderr,
-                        )
+                        print(f"{CLI_COMMAND}: TUI unavailable, falling back to interactive shell ({reason})", file=sys.stderr)
                     else:
-                        print(
-                            f"{CLI_COMMAND}: TUI failed to start, falling back to interactive shell ({reason})",
-                            file=sys.stderr,
-                        )
-                    legacy.run_interactive_shell(root)
+                        print(f"{CLI_COMMAND}: TUI failed to start, falling back to interactive shell ({reason})", file=sys.stderr)
+                    run_interactive_shell(root)
             else:
-                legacy.run_interactive_shell(root)
+                run_interactive_shell(root)
             return
         args.func(args)
     finally:
         close_connections_since(checkpoint)
->>>>>>> 8ed20f4 (refactor(core): split cli.py into modular commands and services, improve worker runtime and git awareness)
 
 
 if __name__ == "__main__":

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 from pathlib import Path
 
 from lex.db import fetch_one, log_event, run_roster_preflight
 from lex.role_contracts import get_role_contract
+from lex.runtime.process_manager import process_is_alive
+from lex.runtime.service import cleanup_stale_worker_runtimes as cleanup_stale_worker_runtimes_service
 
 SESSION_STALE_MINUTES = 15
 WORKER_RUNTIME_STALE_MINUTES = 2
@@ -496,15 +497,8 @@ def release_stale_leases(conn: sqlite3.Connection) -> int:
 
 
 def _process_is_alive(pid: int | None) -> bool:
-    if pid is None or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    # Backward-compatible shim while runtime lifecycle moves into lex.runtime.
+    return process_is_alive(pid)
 
 
 def cleanup_stale_worker_runtimes(
@@ -512,97 +506,7 @@ def cleanup_stale_worker_runtimes(
     *,
     stale_minutes: int = WORKER_RUNTIME_STALE_MINUTES,
 ) -> list[dict[str, object]]:
-    stale_runtimes = conn.execute(
-        """
-        SELECT
-            wr.id,
-            wr.task_id,
-            wr.requested_by_agent_id,
-            wr.status,
-            wr.pid,
-            wr.supervisor_pid,
-            wr.child_pid,
-            wd.name AS worker_name
-        FROM worker_runtimes wr
-        JOIN worker_definitions wd ON wd.id = wr.worker_id
-        WHERE wr.status IN ('launching', 'running')
-          AND wr.heartbeat_at < datetime('now', ?)
-        ORDER BY wr.id ASC
-        """,
-        (f"-{stale_minutes} minutes",),
-    ).fetchall()
-    cleaned: list[dict[str, object]] = []
-    for runtime in stale_runtimes:
-        pid_candidates = []
-        for pid in (runtime["child_pid"], runtime["pid"], runtime["supervisor_pid"]):
-            if pid and pid not in pid_candidates:
-                pid_candidates.append(pid)
-        live_pids = [pid for pid in pid_candidates if _process_is_alive(pid)]
-        if live_pids:
-            continue
-        conn.execute(
-            """
-            UPDATE worker_runtimes
-            SET status = 'failed',
-                ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP)
-            WHERE id = ?
-            """,
-            (runtime["id"],),
-        )
-        blocked_packets = conn.execute(
-            """
-            SELECT id, task_id
-            FROM dispatch_packets
-            WHERE runtime_id = ?
-              AND delivery_status IN ('delivered', 'acknowledged')
-            ORDER BY id ASC
-            """,
-            (runtime["id"],),
-        ).fetchall()
-        conn.execute(
-            """
-            UPDATE dispatch_packets
-            SET delivery_status = 'failed',
-                completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
-                completion_note = ?
-            WHERE runtime_id = ?
-              AND delivery_status IN ('delivered', 'acknowledged')
-            """,
-            (f"runtime {runtime['id']} failed after stale heartbeat", runtime["id"]),
-        )
-        log_event(
-            conn,
-            "worker.runtime_failed",
-            task_id=runtime["task_id"],
-            agent_id=runtime["requested_by_agent_id"],
-            payload={
-                "runtime_id": runtime["id"],
-                "worker_name": runtime["worker_name"],
-                "reason": "stale_heartbeat",
-                "stale_minutes": stale_minutes,
-            },
-        )
-        for packet in blocked_packets:
-            log_event(
-                conn,
-                "dispatch.packet_completed",
-                task_id=packet["task_id"],
-                agent_id=runtime["requested_by_agent_id"],
-                payload={
-                    "packet_id": packet["id"],
-                    "status": "failed",
-                    "note": f"runtime {runtime['id']} failed after stale heartbeat",
-                },
-            )
-        cleaned.append(
-            {
-                "runtime_id": runtime["id"],
-                "worker_name": runtime["worker_name"],
-                "stale_minutes": stale_minutes,
-                "packet_count": len(blocked_packets),
-            }
-        )
-    return cleaned
+    return cleanup_stale_worker_runtimes_service(conn, stale_minutes=stale_minutes)
 
 
 def capture_git_snapshot(cwd: str | None = None) -> dict:
@@ -629,7 +533,8 @@ def capture_git_snapshot(cwd: str | None = None) -> dict:
         return null_snapshot
 
     staged_out = run(["git", "diff", "--name-only", "--cached"]) or ""
-    dirty_out = run(["git", "diff", "--name-only"]) or ""
+    # --porcelain includes staged, unstaged, and untracked files.
+    dirty_out = run(["git", "status", "--porcelain"]) or ""
 
     base_ref: str | None = None
     for remote_ref in ("origin/main", "origin/master"):

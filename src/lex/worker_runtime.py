@@ -3,12 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sqlite3
 import subprocess
 import time
 from pathlib import Path
 
 from lex.db import connect, initialize_database, resolve_paths
+<<<<<<< HEAD
 from lex.dispatch import worker_runtime_dir
 
 
@@ -53,6 +53,17 @@ def _update_runtime(conn: sqlite3.Connection, runtime_id: int, *, status: str, e
     query += " WHERE id = ?"
     params.append(runtime_id)
     conn.execute(query, tuple(params))
+=======
+from lex.discovery import LexDiscovery
+from lex.runtime.inbox import worker_runtime_dir
+from lex.runtime.repository import (
+    load_runtime_execution,
+    mark_runtime_finished,
+    mark_runtime_running,
+    record_runtime_process_context,
+    touch_runtime_heartbeat,
+)
+>>>>>>> 8ed20f4 (refactor(core): split cli.py into modular commands and services, improve worker runtime and git awareness)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -64,7 +75,7 @@ def main(argv: list[str] | None = None) -> None:
     paths = resolve_paths(Path(args.root).resolve())
     conn = connect(paths.db_path)
     initialize_database(conn)
-    runtime = _load_runtime(conn, args.runtime_id)
+    runtime = load_runtime_execution(conn, args.runtime_id)
     runtime_dir = worker_runtime_dir(paths, args.runtime_id)
     inbox_path = Path(runtime["inbox_path"] or runtime_dir / "inbox")
     inbox_path.mkdir(parents=True, exist_ok=True)
@@ -82,36 +93,19 @@ def main(argv: list[str] | None = None) -> None:
     command = json.loads(runtime["command_json"])
     cwd = runtime["cwd"] or str(paths.root)
 
-    conn.execute(
-        """
-        UPDATE worker_runtimes
-        SET status = 'running',
-            pid = ?,
-            supervisor_pid = ?,
-            cwd = ?,
-            inbox_path = ?,
-            log_path = ?,
-            error_path = ?,
-            started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
-            heartbeat_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-        """,
-        (os.getpid(), os.getpid(), cwd, str(inbox_path), str(stdout_path), str(stderr_path), args.runtime_id),
-    )
-    conn.execute(
-        """
-        INSERT INTO events (event_type, task_id, agent_id, session_id, payload_json)
-        SELECT 'worker.runtime_started', wr.task_id, wr.requested_by_agent_id, NULL,
-               json_object('runtime_id', wr.id, 'worker_name', wd.name, 'cwd', ?)
-        FROM worker_runtimes wr
-        JOIN worker_definitions wd ON wd.id = wr.worker_id
-        WHERE wr.id = ?
-        """,
-        (cwd, args.runtime_id),
+    record_runtime_process_context(
+        conn,
+        runtime_id=args.runtime_id,
+        pid=os.getpid(),
+        cwd=cwd,
+        inbox_path=str(inbox_path),
+        stdout_path=str(stdout_path),
+        stderr_path=str(stderr_path),
     )
     conn.commit()
 
     with stdout_path.open("ab") as stdout_handle, stderr_path.open("ab") as stderr_handle:
+<<<<<<< HEAD
         child = subprocess.Popen(
             command,
             cwd=cwd,
@@ -138,9 +132,69 @@ def main(argv: list[str] | None = None) -> None:
             conn.commit()
             if exit_code is None:
                 time.sleep(1.0)
+=======
+        try:
+            try:
+                child = subprocess.Popen(
+                    command,
+                    cwd=cwd,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout_handle,
+                    stderr=stderr_handle,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            except Exception as exc:
+                mark_runtime_finished(conn, runtime_id=args.runtime_id, status="failed", exit_code=-1, ended=True)
+                conn.execute(
+                    """
+                    INSERT INTO events (event_type, task_id, agent_id, session_id, payload_json)
+                    SELECT 'worker.runtime_finished', wr.task_id, wr.requested_by_agent_id, NULL,
+                           json_object(
+                               'runtime_id', wr.id,
+                               'worker_name', wd.name,
+                               'status', 'failed',
+                               'exit_code', -1,
+                               'reason', 'spawn_failed',
+                               'error', ?
+                           )
+                    FROM worker_runtimes wr
+                    JOIN worker_definitions wd ON wd.id = wr.worker_id
+                    WHERE wr.id = ?
+                    """,
+                    (str(exc), args.runtime_id),
+                )
+                conn.commit()
+                return
+            mark_runtime_running(conn, runtime_id=args.runtime_id, child_pid=child.pid)
+            conn.execute(
+                """
+                INSERT INTO events (event_type, task_id, agent_id, session_id, payload_json)
+                SELECT 'worker.runtime_started', wr.task_id, wr.requested_by_agent_id, NULL,
+                       json_object('runtime_id', wr.id, 'worker_name', wd.name, 'cwd', ?)
+                FROM worker_runtimes wr
+                JOIN worker_definitions wd ON wd.id = wr.worker_id
+                WHERE wr.id = ?
+                """,
+                (cwd, args.runtime_id),
+            )
+            conn.commit()
+
+            exit_code: int | None = None
+            while exit_code is None:
+                exit_code = child.poll()
+                touch_runtime_heartbeat(conn, args.runtime_id)
+                conn.commit()
+                if exit_code is None:
+                    time.sleep(1.0)
+        finally:
+            if discovery:
+                discovery.stop()
+>>>>>>> 8ed20f4 (refactor(core): split cli.py into modular commands and services, improve worker runtime and git awareness)
 
     final_status = "exited" if exit_code == 0 else "failed"
-    _update_runtime(conn, args.runtime_id, status=final_status, exit_code=exit_code, ended=True)
+    mark_runtime_finished(conn, runtime_id=args.runtime_id, status=final_status, exit_code=exit_code, ended=True)
     conn.execute(
         """
         INSERT INTO events (event_type, task_id, agent_id, session_id, payload_json)
