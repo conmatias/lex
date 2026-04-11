@@ -13,13 +13,6 @@ from lex.db import close_connections_since, connection_checkpoint
 from lex.tui import run_tui
 
 CLI_COMMAND = legacy.CLI_COMMAND
-run_dx = legacy.run_dx
-
-
-def __getattr__(name: str):
-    return getattr(legacy, name)
-
-
 def cmd_dx(args: argparse.Namespace) -> None:
     root = Path(args.root).resolve()
     discovery = None
@@ -46,7 +39,7 @@ def cmd_dx(args: argparse.Namespace) -> None:
             discovery.start_announcing()
 
     try:
-        run_dx(root)
+        legacy.run_dx(root)
     finally:
         if discovery:
             discovery.stop()

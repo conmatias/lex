@@ -8,6 +8,8 @@ from typing import Iterable
 
 
 DEFAULT_LEX_DIRNAME = ".lex"
+
+_OPEN_CONNECTIONS: list[sqlite3.Connection] = []
 DEFAULT_DB_NAME = "lex.db"
 ROLE_MIGRATIONS: dict[str, tuple[str, str]] = {
     "engineer": ("dev", "engineer"),
@@ -565,10 +567,27 @@ def find_lex_root(start: Path | None = None) -> LexPaths | None:
         current = parent
 
 
+def connection_checkpoint() -> int:
+    return len(_OPEN_CONNECTIONS)
+
+
+def close_connections_since(checkpoint: int) -> None:
+    if checkpoint < 0:
+        checkpoint = 0
+    tail = _OPEN_CONNECTIONS[checkpoint:]
+    del _OPEN_CONNECTIONS[checkpoint:]
+    for conn in tail:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
+    _OPEN_CONNECTIONS.append(conn)
     return conn
 
 

@@ -41,7 +41,12 @@ from lex.coordination import (
     retire_agent,
     release_stale_leases,
 )
-from lex.dx import run_dx
+try:
+    from lex.dx import run_dx
+except ImportError:
+    def run_dx(root: Path) -> None:
+        print("error: experimental dx module not found in this branch", file=sys.stderr)
+        raise SystemExit(1)
 from lex.discovery import LexDiscovery
 from lex.db import BUILTIN_SPECIALTIES, close_connections_since, connect, connection_checkpoint, derive_event_provenance, detect_path_conflicts, ensure_workspace, fetch_one, find_lex_root, initialize_database, list_specialties, log_event, resolve_paths, run_roster_preflight
 from lex.dispatch import (
