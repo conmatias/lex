@@ -395,11 +395,16 @@ class TestCommandBehaviours:
         assert result.status == "ok"
         assert "3" in result.confirmation
 
-    def test_close_requires_confirmation(self):
+    def test_close_is_immediate(self):
         ctrl = _make_controller(["codex"])
         result = ctrl.submit("/close codex")
-        assert result.status == "confirm_required"
+        assert result.status == "ok"
         assert result.state_patch.get("close_target") == "codex"
+
+    def test_close_missing_arg_is_error(self):
+        ctrl = _make_controller(["codex"])
+        result = ctrl.submit("/close")
+        assert result.status == "error"
 
     def test_reply_uses_expanded_slice(self):
         ctrl = _make_controller(["codex"])

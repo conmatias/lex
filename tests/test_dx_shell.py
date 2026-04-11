@@ -119,10 +119,10 @@ def test_dx_main_dispatches_to_runner(tmp_path, monkeypatch):
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
 
-    def fake_run_dx(root):
+    def fake_run_shell(root):
         called["root"] = root
 
-    monkeypatch.setattr("lex.dx.app.run_dx", fake_run_dx)
+    monkeypatch.setattr("lex.dx.cli.run_shell", fake_run_shell)
 
     main(["--root", str(tmp_path)])
 

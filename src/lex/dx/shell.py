@@ -10,6 +10,7 @@ from lex.dashboard import load_dashboard_state
 from lex.dx.app import build_diff, build_dx_view
 from lex.dx.commands import RoutingController
 from lex.dx.pty_runtime import PTYManager, TerminalSession
+from lex.dx.runtime_service import DaemonRuntimeClient, LocalRuntimeClient
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,7 @@ class PromptState:
     buffer: str = ""
     history: list[str] = field(default_factory=list)
     history_index: int | None = None
+    last_command: str = ""
 
 
 def build_shell_summaries(
@@ -92,6 +94,7 @@ class DxShell:
         pty_manager: PTYManager | None = None,
         pty_manager_factory: Callable[[], PTYManager] = PTYManager,
         runtime_command_builder: Callable[[str], str] | None = None,
+        runtime_backend: str = "local",
     ):
         self.root = root
         self.prompt = PromptState()
@@ -103,18 +106,23 @@ class DxShell:
             list_slices=lambda: [summary.id for summary in self.summaries],
         )
         self.pty_manager: PTYManager | None = pty_manager
+        self.runtime_backend = runtime_backend
+        self.runtime_client: LocalRuntimeClient | DaemonRuntimeClient | None = (
+            LocalRuntimeClient(pty_manager) if pty_manager is not None else None
+        )
         self.focus_index = 0
         self.keyboard_focus = "feed"
-        self.status = "j/k=move  enter=route target  space=expand  tab=prompt/feed  c=drawer  r=refresh  q=quit"
+        self.status = "tab=prompt  j/k=navigate  enter=target  space=expand  c=drawer  q=quit"
         # Tracks the last (rows, cols) sent to each runtime session so we only
         # call resize() when dimensions actually change.
         self._last_resize: dict[int, tuple[int, int]] = {}
         self.refresh()
 
     def stop(self) -> None:
-        if self.pty_manager is not None:
-            self.pty_manager.stop()
-            self.pty_manager = None
+        if self.runtime_client is not None:
+            self.runtime_client.stop()
+            self.runtime_client = None
+        self.pty_manager = None
 
     def refresh(self) -> None:
         self.state = load_dashboard_state(self.root)
@@ -163,15 +171,28 @@ class DxShell:
 
     def header_text(self) -> str:
         target = self.controller.state.routing_target_id or "no target"
-        focused = self.focused_summary()
-        task_label = focused.task_label if focused else "no slice"
-        return f"dx  ›  {target}  ›  {task_label}"
+        return f"dx  ▸  {target}"
+
+    def ribbon_height(self) -> int:
+        """Extra rows reserved for the command ribbon (separator + target line)."""
+        return 2
+
+    def ribbon_target_line(self) -> str:
+        """Single line showing the current routing target and its live state."""
+        target_id = self.controller.state.routing_target_id
+        if not target_id:
+            return "  no target"
+        summary = next((s for s in self.summaries if s.id == target_id), None)
+        if summary is None:
+            return f"  ▸ {target_id}"
+        return f"  ▸ {summary.title}  [{summary.state}]  {summary.task_label}"
 
     def submit_prompt(self, raw: str):
         result = self.controller.submit(raw)
         text = raw.strip()
         if text:
             self.prompt.history.append(text)
+            self.prompt.last_command = text
         self.prompt.history_index = None
         self.prompt.buffer = ""
         patch = result.state_patch or {}
@@ -187,6 +208,13 @@ class DxShell:
             self._send_to_runtime(patch["review_target"], patch["review_answer"], fallback_status=result.confirmation)
         elif "stop_target" in patch:
             self._close_runtime(patch["stop_target"], verb="stopped")
+        elif "close_target" in patch:
+            self._close_runtime(patch["close_target"], verb="closed")
+        elif "broadcast_targets" in patch and "broadcast_message" in patch:
+            msg = patch["broadcast_message"]
+            for target in patch["broadcast_targets"]:
+                self._send_to_runtime(target, msg, fallback_status=None)
+            self.status = result.confirmation or f"broadcast to {len(patch['broadcast_targets'])} slices"
         elif result.confirmation:
             self.status = result.confirmation
         elif result.error_message:
@@ -196,27 +224,32 @@ class DxShell:
         return result
 
     def _list_runtime_sessions(self) -> list[TerminalSession]:
-        if self.pty_manager is None:
+        client = self._ensure_runtime_client()
+        if client is None:
             return []
-        return self.pty_manager.list_sessions()
+        return client.list_sessions()
 
     def _find_runtime_session(self, slice_id: str) -> TerminalSession | None:
-        if self.pty_manager is None:
+        client = self._ensure_runtime_client()
+        if client is None:
             return None
-        for session in self.pty_manager.list_sessions():
+        for session in client.list_sessions():
             if session.title == slice_id:
                 return session
         return None
 
     def _spawn_runtime(self, kind: str) -> None:
-        manager = self._ensure_pty_manager()
+        client = self._ensure_runtime_client()
+        if client is None:
+            self.status = "runtime backend unavailable"
+            return
         try:
             cmd = self._runtime_command_builder(kind)
         except RuntimeError as exc:
             self.status = str(exc)
             return
         try:
-            session_id = manager.spawn(
+            session_id = client.spawn(
                 kind,
                 cmd,
                 cwd=self.root,
@@ -225,7 +258,7 @@ class DxShell:
         except Exception as exc:
             self.status = f"spawn failed: {exc}"
             return
-        session = manager.get_session(session_id)
+        session = client.get_session(session_id)
         if session is None:
             self.status = f"failed to spawn {kind}"
             return
@@ -249,9 +282,15 @@ class DxShell:
         if session is None:
             self.status = f"slice {slice_id} has no PTY session"
             return
-        manager = self._ensure_pty_manager()
-        manager.write(session.id, self._runtime_submit_payload(session, message))
-        manager.set_display_state(session.id, "expanded")
+        if session.status == "exited":
+            self.status = f"{slice_id} has exited — use /close to remove it"
+            return
+        client = self._ensure_runtime_client()
+        if client is None:
+            self.status = "runtime backend unavailable"
+            return
+        client.write(session.id, self._runtime_submit_payload(session, message))
+        client.set_display_state(session.id, "expanded")
         self.controller.set_expanded_slice(slice_id)
         self.status = fallback_status or f"sent to {slice_id}"
         self.refresh()
@@ -268,10 +307,11 @@ class DxShell:
 
     def _close_runtime(self, slice_id: str, *, verb: str) -> None:
         session = self._find_runtime_session(slice_id)
-        if session is None or self.pty_manager is None:
+        client = self._ensure_runtime_client()
+        if session is None or client is None:
             self.status = f"slice {slice_id} has no PTY session"
             return
-        self.pty_manager.close(session.id)
+        client.close(session.id)
         if self.controller.state.routing_target_id == slice_id:
             self.controller.set_routing_target(None)
         if self.controller.state.expanded_slice_id == slice_id:
@@ -281,10 +321,19 @@ class DxShell:
         self.refresh()
         self.status = f"{verb} {slice_id}"
 
-    def _ensure_pty_manager(self) -> PTYManager:
-        if self.pty_manager is None:
-            self.pty_manager = self._pty_manager_factory()
-        return self.pty_manager
+    def _ensure_runtime_client(self) -> LocalRuntimeClient | DaemonRuntimeClient | None:
+        if self.runtime_client is not None:
+            return self.runtime_client
+        if self.runtime_backend == "daemon":
+            try:
+                self.runtime_client = DaemonRuntimeClient(self.root, autostart=True)
+                return self.runtime_client
+            except Exception as exc:
+                self.status = f"daemon unavailable: {exc}; using local runtime"
+        manager = self.pty_manager or self._pty_manager_factory()
+        self.pty_manager = manager
+        self.runtime_client = LocalRuntimeClient(manager)
+        return self.runtime_client
 
     def runtime_viewport_lines(self, summary: SliceSummary, *, max_lines: int) -> list[str]:
         if summary.source != "runtime":
@@ -397,9 +446,10 @@ class DxShell:
             return
         new_id = None if self.controller.state.expanded_slice_id == summary.id else summary.id
         self.controller.set_expanded_slice(new_id)
-        if summary.runtime_session_id is not None:
+        client = self._ensure_runtime_client()
+        if summary.runtime_session_id is not None and client is not None:
             state = "expanded" if new_id is not None else "collapsed"
-            self._ensure_pty_manager().set_display_state(summary.runtime_session_id, state)
+            client.set_display_state(summary.runtime_session_id, state)
         if new_id is not None and summary.runtime_session_id is not None:
             self.controller.set_routing_target(summary.id)
         self.refresh()
@@ -485,8 +535,10 @@ class DxShell:
         stdscr.addnstr(0, 0, self.header_text().ljust(width - 1), width - 1, curses.A_REVERSE)
 
         prompt_row = height - 1
+        ribbon_h = self.ribbon_height()
         drawer_height = max(height // 3, 4) if self.controller.state.drawer_open else 0
-        feed_bottom = prompt_row - drawer_height - 1
+        # Reserve: status line + ribbon (separator + target line)
+        feed_bottom = prompt_row - drawer_height - 1 - ribbon_h
 
         if not self.summaries:
             stdscr.addnstr(2, 2, "No active slices", width - 4)
@@ -497,12 +549,13 @@ class DxShell:
                 dominant = layout.dominant
                 # Propagate terminal size to the dominant PTY session whenever
                 # dimensions change so embedded TUIs reflow correctly.
-                if dominant.runtime_session_id is not None and self.pty_manager is not None:
+                client = self._ensure_runtime_client()
+                if dominant.runtime_session_id is not None and client is not None:
                     dom_rows = max(layout.dominant_height - 1, 1)
                     dom_cols = max(width - 6, 1)
                     prev = self._last_resize.get(dominant.runtime_session_id)
                     if prev != (dom_rows, dom_cols):
-                        self.pty_manager.resize(dominant.runtime_session_id, dom_rows, dom_cols)
+                        client.resize(dominant.runtime_session_id, dom_rows, dom_cols)
                         self._last_resize[dominant.runtime_session_id] = (dom_rows, dom_cols)
                 focused = self.focused_summary()
                 dominant_focus = focused is not None and focused.id == dominant.id and self.keyboard_focus == "feed"
@@ -528,7 +581,11 @@ class DxShell:
                 focused = idx == self.focus_index and self.keyboard_focus == "feed"
                 prefix = "▶" if focused else " "
                 marker = _state_icon(summary)
-                line = f"{prefix} {marker} {summary.title} [{summary.state}]  {summary.task_label}  {summary.detail}"
+                # Focused or attention slices get full detail; others compress to a single label.
+                if focused or summary.attention_flag:
+                    line = f"{prefix} {marker} {summary.title} [{summary.state}]  {summary.task_label}  {summary.detail}"
+                else:
+                    line = f"{prefix} {marker} {summary.title} [{summary.state}]"
                 attr = curses.A_BOLD if focused else curses.A_NORMAL
                 stdscr.addnstr(row, 1, line, width - 2, attr)
                 row += 1
@@ -542,10 +599,25 @@ class DxShell:
             for idx, line in enumerate(drawer_lines[: max(drawer_height - 1, 0)]):
                 stdscr.addnstr(drawer_top + 1 + idx, 2, line, width - 4)
 
-        prompt_prefix = "› " if self.keyboard_focus == "prompt" else "  "
-        stdscr.addnstr(prompt_row, 0, (prompt_prefix + self.prompt.buffer).ljust(width - 1), width - 1, curses.A_REVERSE)
+        # Command ribbon: separator + routing target breadcrumb
+        ribbon_sep_row = prompt_row - 1 - ribbon_h
+        if ribbon_sep_row > 0:
+            stdscr.hline(ribbon_sep_row, 0, "─", width)
+            stdscr.addnstr(ribbon_sep_row + 1, 0, self.ribbon_target_line().ljust(width - 1), width - 1)
+
+        # Status / feedback line
         if prompt_row - 1 > 0:
             stdscr.addnstr(prompt_row - 1, 0, self.status.ljust(width - 1), width - 1)
+
+        # Prompt — prefix shows routing target when active
+        target = self.controller.state.routing_target_id
+        if self.keyboard_focus == "prompt" and target:
+            prompt_prefix = f"› {target} ▶ "
+        elif self.keyboard_focus == "prompt":
+            prompt_prefix = "›  "
+        else:
+            prompt_prefix = "   "
+        stdscr.addnstr(prompt_row, 0, (prompt_prefix + self.prompt.buffer).ljust(width - 1), width - 1, curses.A_REVERSE)
         stdscr.refresh()
 
     def run(self) -> None:
@@ -569,7 +641,7 @@ class DxShell:
 
 
 def run_shell(root: Path) -> None:
-    shell = DxShell(root)
+    shell = DxShell(root, runtime_backend="daemon")
     try:
         shell.run()
     finally:

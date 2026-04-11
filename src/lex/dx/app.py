@@ -887,9 +887,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    root = Path(args.root).resolve()
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
-        raise SystemExit("dx requires an interactive terminal — run it from a real TTY")
-    run_dx(root)
+    from lex.dx.cli import main as cli_main
+
+    cli_main(argv)

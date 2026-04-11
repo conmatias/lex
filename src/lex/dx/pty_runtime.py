@@ -183,6 +183,10 @@ class PTYManager:
             if not session or session.master_fd is None:
                 return
 
+            # Don't send bare enters for empty messages.
+            if not text:
+                return
+
             # PTY-backed coding CLIs generally expect Enter/submit semantics
             # rather than a literal linefeed. Preserve any explicit caller
             # terminator, otherwise send carriage return as the default submit.

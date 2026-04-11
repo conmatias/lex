@@ -266,6 +266,17 @@ class TestWrite:
         assert any("ping" in line for line in s.output)
         mgr.close(sid)
 
+    def test_write_empty_string_is_noop(self, mgr):
+        """Empty string must not submit a bare carriage return to the process."""
+        sid = mgr.spawn("shell", "cat")
+        before_output_len = len(mgr.get_session(sid).output)
+        mgr.write(sid, "")
+        time.sleep(0.1)
+        after_output_len = len(mgr.get_session(sid).output)
+        # Empty write must not cause any new output from cat
+        assert after_output_len == before_output_len
+        mgr.close(sid)
+
 
 # ---------------------------------------------------------------------------
 # stop()

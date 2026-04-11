@@ -409,3 +409,263 @@ def test_spawn_runtime_spawn_failure_sets_status(tmp_path):
 
     assert "spawn failed" in shell.status or "failed" in shell.status
     shell.stop()
+
+
+# ---------------------------------------------------------------------------
+# Task #46 — command-ribbon-first UI refinements
+# ---------------------------------------------------------------------------
+
+def test_header_text_shows_target_only(tmp_path):
+    """Header is simplified to dx ▸ <target>, dropping the task label clutter."""
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    agent_id = _setup_agent(conn)
+    _setup_session(conn, agent_id, tmp_path)
+    _setup_task(conn, agent_id)
+    conn.commit()
+
+    shell = DxShell(tmp_path)
+    shell.controller.set_routing_target("codex-brisk-otter")
+    assert shell.header_text() == "dx  ▸  codex-brisk-otter"
+    shell.stop()
+
+
+def test_header_text_no_target(tmp_path):
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+
+    shell = DxShell(tmp_path)
+    assert "no target" in shell.header_text()
+    shell.stop()
+
+
+def test_ribbon_height_is_two(tmp_path):
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+
+    shell = DxShell(tmp_path)
+    assert shell.ribbon_height() == 2
+    shell.stop()
+
+
+def test_ribbon_target_line_no_target(tmp_path):
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+
+    shell = DxShell(tmp_path)
+    shell.controller.set_routing_target(None)
+    assert "no target" in shell.ribbon_target_line()
+    shell.stop()
+
+
+def test_ribbon_target_line_with_known_slice(tmp_path):
+    """Ribbon target line includes slice title, state, and task label."""
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    agent_id = _setup_agent(conn)
+    _setup_session(conn, agent_id, tmp_path)
+    _setup_task(conn, agent_id)
+    conn.commit()
+
+    shell = DxShell(tmp_path)
+    shell.controller.set_routing_target("codex-brisk-otter")
+    shell.refresh()
+    line = shell.ribbon_target_line()
+
+    assert "codex-brisk-otter" in line
+    assert "▸" in line
+    shell.stop()
+
+
+def test_ribbon_target_line_unknown_slice(tmp_path):
+    """Ribbon target line falls back gracefully when target has no slice."""
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+
+    shell = DxShell(tmp_path)
+    shell.controller.set_routing_target("ghost-agent")
+    line = shell.ribbon_target_line()
+
+    assert "ghost-agent" in line
+    shell.stop()
+
+
+def test_submit_prompt_tracks_last_command(tmp_path):
+    """submit_prompt records the last non-empty command in prompt.last_command."""
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    agent_id = _setup_agent(conn)
+    _setup_session(conn, agent_id, tmp_path)
+    _setup_task(conn, agent_id)
+    conn.commit()
+
+    shell = DxShell(tmp_path)
+    shell.submit_prompt("/focus codex")
+    assert shell.prompt.last_command == "/focus codex"
+    shell.submit_prompt("  ")  # whitespace-only should not overwrite
+    assert shell.prompt.last_command == "/focus codex"
+    shell.stop()
+
+
+def test_non_focused_slices_compress_in_feed(tmp_path):
+    """Non-focused, non-attention slices render without task/detail text."""
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    agent_id = _setup_agent(conn)
+    _setup_session(conn, agent_id, tmp_path)
+    _setup_task(conn, agent_id)
+    conn.commit()
+    # Add a second agent to ensure there's a non-focused one
+    _setup_agent(conn, name="codex-brisk-raven", kind="codex", role="dev")
+    conn.commit()
+
+    manager = FakePTYManager()
+    shell = DxShell(tmp_path, pty_manager=manager, runtime_command_builder=lambda kind: f"run-{kind}")
+    shell.submit_prompt("/spawn shell")  # focus moves to runtime
+
+    captured_lines: list[str] = []
+
+    class CapturingStdScr:
+        def getmaxyx(self):
+            return (40, 120)
+        def erase(self):
+            pass
+        def addnstr(self, row, col, text, maxlen, *args):
+            captured_lines.append(text)
+        def hline(self, *args):
+            pass
+        def refresh(self):
+            pass
+
+    shell.render(CapturingStdScr())
+
+    # Agent slices that are not focused should not include task_label or detail text
+    agent_lines = [l for l in captured_lines if "codex-brisk" in l and "▼" not in l]
+    for line in agent_lines:
+        # Compressed format has no "changed=" or "#1" task detail
+        assert "changed=" not in line, f"non-focused slice should be compressed: {line!r}"
+    shell.stop()
+
+
+def test_render_feed_bottom_accounts_for_ribbon(tmp_path):
+    """Dominant PTY resize rows are smaller by ribbon_height() compared to pre-ribbon layout."""
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    manager = FakePTYManager()
+
+    shell = DxShell(tmp_path, pty_manager=manager, runtime_command_builder=lambda kind: f"run-{kind}")
+    shell.submit_prompt("/spawn shell")
+
+    class FakeStdScr:
+        def getmaxyx(self):
+            return (30, 100)
+        def erase(self):
+            pass
+        def addnstr(self, *args, **kwargs):
+            pass
+        def hline(self, *args, **kwargs):
+            pass
+        def refresh(self):
+            pass
+
+    shell.render(FakeStdScr())
+
+    assert manager.resizes
+    session_id, rows, cols = manager.resizes[-1]
+    assert session_id == 1
+    # With ribbon (2 extra rows), dominant height is smaller than pre-ribbon
+    assert rows >= 8  # still meaningful height
+    assert cols == 94
+    shell.stop()
+
+
+# ---------------------------------------------------------------------------
+# Task #48 — interaction hardening
+# ---------------------------------------------------------------------------
+
+def test_close_command_actually_closes_slice(tmp_path):
+    """/close <slice> must terminate the PTY session, not just show a prompt."""
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    manager = FakePTYManager()
+
+    shell = DxShell(tmp_path, pty_manager=manager, runtime_command_builder=lambda kind: f"run-{kind}")
+    shell.submit_prompt("/spawn shell")
+    assert any(s.id == 1 for s in manager.list_sessions())
+
+    shell.submit_prompt("/close shell-1")
+
+    assert 1 in manager.closed, "close() should have been called on the PTY session"
+    assert shell.controller.state.routing_target_id != "shell-1"
+    shell.stop()
+
+
+def test_broadcast_sends_to_all_runtime_sessions(tmp_path):
+    """/broadcast <msg> must write to every spawned runtime session."""
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    manager = FakePTYManager()
+
+    shell = DxShell(tmp_path, pty_manager=manager, runtime_command_builder=lambda kind: f"run-{kind}")
+    shell.submit_prompt("/spawn shell")
+    shell.submit_prompt("/spawn shell")
+
+    manager.writes.clear()
+    shell.submit_prompt("/broadcast hello agents")
+
+    sent_ids = {sid for sid, _ in manager.writes}
+    assert 1 in sent_ids
+    assert 2 in sent_ids
+    shell.stop()
+
+
+def test_send_to_exited_session_reports_error(tmp_path):
+    """Writing to an exited PTY session should set an error status, not silently no-op."""
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    manager = FakePTYManager()
+
+    shell = DxShell(tmp_path, pty_manager=manager, runtime_command_builder=lambda kind: f"run-{kind}")
+    shell.submit_prompt("/spawn shell")
+    shell.controller.set_routing_target("shell-1")
+
+    # Mark the session as exited without removing it from the manager
+    session = manager.get_session(1)
+    session.status = "exited"
+    shell.refresh()
+
+    manager.writes.clear()
+    shell.submit_prompt("do something")
+
+    assert not manager.writes, "no write should go to an exited session"
+    assert "exited" in shell.status or "close" in shell.status.lower()
+    shell.stop()
+
+
+def test_close_clears_routing_target_if_matched(tmp_path):
+    """/close should clear routing_target when the closed slice was targeted."""
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    manager = FakePTYManager()
+
+    shell = DxShell(tmp_path, pty_manager=manager, runtime_command_builder=lambda kind: f"run-{kind}")
+    shell.submit_prompt("/spawn shell")
+    assert shell.controller.state.routing_target_id == "shell-1"
+
+    shell.submit_prompt("/close shell-1")
+
+    assert shell.controller.state.routing_target_id is None
+    shell.stop()

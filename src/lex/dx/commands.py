@@ -548,8 +548,8 @@ class RoutingController:
         if isinstance(resolved, CommandDispatchResult):
             return resolved
         return CommandDispatchResult(
-            status="confirm_required",
-            confirmation=f"close slice {resolved}? press enter to confirm or esc to cancel",
+            status="ok",
+            confirmation=f"closed {resolved}",
             state_patch={"close_target": resolved},
         )
 
