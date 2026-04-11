@@ -33,6 +33,12 @@ class LexDiscovery:
         self.peers: dict[str, LexPeer] = {}
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
+        self.last_error: str | None = None
+
+    def _record_error(self, where: str, exc: Exception) -> None:
+        message = f"{where}: {type(exc).__name__}: {exc}"
+        with self._lock:
+            self.last_error = message
 
     def start_announcing(self, interval: int = 5):
         """Starts a background thread to announce this Lex instance on the local network."""
@@ -52,9 +58,8 @@ class LexDiscovery:
             while not self._stop_event.is_set():
                 try:
                     sock.sendto(message, (MCAST_GRP, MCAST_PORT))
-                except Exception:
-                    # Silently ignore network errors during background announcement
-                    pass
+                except Exception as exc:
+                    self._record_error("announce", exc)
                 time.sleep(interval)
             sock.close()
 
@@ -101,7 +106,8 @@ class LexDiscovery:
                     pass
             except socket.timeout:
                 break
-            except Exception:
+            except Exception as exc:
+                self._record_error("listen", exc)
                 break
         sock.close()
 

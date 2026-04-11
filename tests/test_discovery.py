@@ -100,3 +100,39 @@ def test_discovery_ignores_malformed_payloads(monkeypatch):
     peers = discovery.get_peers()
     assert len(peers) == 1
     assert peers[0].agent_name == "valid"
+
+
+def test_discovery_records_announce_errors(monkeypatch):
+    class FailingSocket:
+        def __init__(self, *args, **kwargs):
+            pass
+        def setsockopt(self, *args):
+            pass
+        def sendto(self, data, addr):
+            raise OSError("network down")
+        def close(self):
+            pass
+
+    monkeypatch.setattr("socket.socket", FailingSocket)
+    discovery = LexDiscovery({"agent_name": "test-agent", "root_path": "/tmp/lex"})
+    discovery.start_announcing(interval=0.05)
+    time.sleep(0.12)
+    discovery.stop()
+
+    assert discovery.last_error is not None
+    assert "announce" in discovery.last_error
+
+
+def test_discovery_records_listen_errors(monkeypatch):
+    class FailingListenSocket(FakeSocket):
+        def recvfrom(self, bufsize):
+            raise OSError("socket failure")
+
+    fake_sock = FailingListenSocket()
+    monkeypatch.setattr("socket.socket", lambda *args, **kwargs: fake_sock)
+
+    discovery = LexDiscovery()
+    discovery.listen(timeout=0.1)
+
+    assert discovery.last_error is not None
+    assert "listen" in discovery.last_error

@@ -120,6 +120,13 @@ class RexTui:
         self.status = KEYBINDINGS
         self.has_color = False
 
+    def _open_conn(self):
+        from lex.db import connect, initialize_database, resolve_paths
+        paths = resolve_paths(str(self.root))
+        conn = connect(paths.db_path)
+        initialize_database(conn)
+        return conn
+
     def run(self) -> None:
         curses.wrapper(self._main)
 
@@ -433,30 +440,20 @@ class RexTui:
             self.selected_session = min(max(self.selected_session + delta, 0), max(len(self.state.sessions) - 1, 0))
 
     def _create_task(self, stdscr) -> None:
-        from lex.cli import cmd_task_create
+        from lex.services.task_service import create_task
 
         title = self._prompt(stdscr, "task title")
         if not title:
             self.status = "task creation cancelled"
             return
-        cmd_task_create(
-            type("Args", (), {
-                "root": str(self.root),
-                "title": title,
-                "slug": None,
-                "description": "",
-                "priority": 2,
-                "created_by": None,
-                "parent_task": None,
-                "delegation_mode": "direct",
-                "path": [],
-                "force_role_override": False,
-            })()
-        )
-        self.status = f"✔ created task: {title}"
+        try:
+            result = create_task(self._open_conn(), title=title)
+            self.status = f"✔ created task {result.task_id}: {title}"
+        except ValueError as exc:
+            self.status = f"error: {exc}"
 
     def _claim_task(self, stdscr) -> None:
-        from lex.cli import cmd_task_claim
+        from lex.services.task_service import claim_task
 
         if not self.state.tasks:
             self.status = "no tasks to claim"
@@ -467,19 +464,14 @@ class RexTui:
         if not agent:
             self.status = "claim cancelled"
             return
-        cmd_task_claim(
-            type("Args", (), {
-                "root": str(self.root),
-                "task_id": task["id"],
-                "agent": agent,
-                "ttl_minutes": 30,
-                "force_role_override": False,
-            })()
-        )
-        self.status = f"✔ claimed task {task['id']} for {agent}"
+        try:
+            claim_task(self._open_conn(), task_id=task["id"], agent=agent)
+            self.status = f"✔ claimed task {task['id']} for {agent}"
+        except ValueError as exc:
+            self.status = f"error: {exc}"
 
     def _start_session(self, stdscr) -> None:
-        from lex.cli import cmd_session_start
+        from lex.services.session_service import start_session
 
         default_agent = self.state.agents[0]["name"] if self.state.agents else ""
         agent = self._prompt_with_default(stdscr, "agent name", default_agent)
@@ -487,70 +479,63 @@ class RexTui:
             self.status = "session start cancelled"
             return
         label = self._prompt_with_default(stdscr, "session label", "primary")
-        cmd_session_start(
-            type("Args", (), {
-                "root": str(self.root),
-                "agent": agent,
-                "label": label,
-                "cwd": str(self.root),
-                "capability": [],
-            })()
-        )
-        self.status = f"✔ started session for {agent}"
+        try:
+            result = start_session(self._open_conn(), agent=agent, label=label, cwd=str(self.root))
+            self.status = f"✔ started session {result.session_id} for {agent}"
+        except ValueError as exc:
+            self.status = f"error: {exc}"
 
     def _register_agent(self, stdscr) -> None:
-        from lex.cli import cmd_agent_identify, cmd_agent_register
+        from lex.services.agent_service import identify_agent, register_agent
 
         kind = self._prompt_choice(stdscr, "agent kind", ["codex", "claude", "cursor", "gemini"], "codex")
         role = self._prompt_choice(stdscr, "agent role", ["dev", "pm", "auditor", "infra"], "dev")
         specialty = self._prompt(stdscr, "agent specialty (optional)")
         name = self._prompt(stdscr, "agent name (blank to generate)")
-        if name:
-            cmd_agent_register(
-                type("Args", (), {
-                    "root": str(self.root),
-                    "name": name,
-                    "kind": kind,
-                    "role": role or None,
-                    "specialty": specialty or None,
-                })()
-            )
-            self.status = f"✔ registered {name}"
-            return
-        cmd_agent_identify(
-            type("Args", (), {
-                "root": str(self.root),
-                "name": None,
-                "kind": kind,
-                "role": role or None,
-                "specialty": specialty or None,
-                "json": False,
-            })()
-        )
-        self.status = f"✔ identified new {kind} agent"
+        try:
+            if name:
+                result = register_agent(
+                    self._open_conn(), name=name, kind=kind,
+                    role=role or None, specialty=specialty or None,
+                )
+                self.status = f"✔ registered {result.name}"
+            else:
+                result = identify_agent(
+                    self._open_conn(), kind=kind,
+                    role=role or None, specialty=specialty or None,
+                )
+                self.status = f"✔ identified {result.name}"
+        except ValueError as exc:
+            self.status = f"error: {exc}"
 
     def _heartbeat_session(self, stdscr) -> None:
-        from lex.cli import cmd_session_heartbeat
+        from lex.services.session_service import send_heartbeat
 
         if not self.state.sessions:
             self.status = "no active sessions"
             return
         session_id = self.state.sessions[self.selected_session]["id"]
-        cmd_session_heartbeat(type("Args", (), {"root": str(self.root), "session_id": int(session_id)})())
-        self.status = f"✔ heartbeat for session {session_id}"
+        try:
+            send_heartbeat(self._open_conn(), session_id=int(session_id))
+            self.status = f"✔ heartbeat for session {session_id}"
+        except ValueError as exc:
+            self.status = f"error: {exc}"
 
     def _end_session(self, stdscr) -> None:
-        from lex.cli import cmd_session_end
+        from lex.services.session_service import end_session
 
         if not self.state.sessions:
             self.status = "no active sessions"
             return
         session_id = self.state.sessions[self.selected_session]["id"]
-        cmd_session_end(type("Args", (), {"root": str(self.root), "session_id": int(session_id)})())
-        self.status = f"✔ ended session {session_id}"
+        try:
+            end_session(self._open_conn(), session_id=int(session_id))
+            self.status = f"✔ ended session {session_id}"
+        except ValueError as exc:
+            self.status = f"error: {exc}"
 
     def _send_message(self, stdscr) -> None:
-        from lex.cli import cmd_msg_send
+        from lex.services.msg_service import send_message
 
         if not self.state.tasks:
             self.status = "no task selected"
@@ -573,21 +558,18 @@ class RexTui:
         if not body:
             self.status = "message cancelled"
             return
-        cmd_msg_send(
-            type("Args", (), {
-                "root": str(self.root),
-                "task_id": task["id"],
-                "from_agent": from_agent,
-                "to_agent": to_agent or None,
-                "type": message_type,
-                "subject": None,
-                "body": body,
-            })()
-        )
-        self.status = f"✔ sent {message_type} on task {task['id']}"
+        try:
+            send_message(
+                self._open_conn(),
+                task_id=task["id"], from_agent=from_agent,
+                to_agent=to_agent or None, message_type=message_type, body=body,
+            )
+            self.status = f"✔ sent {message_type} on task {task['id']}"
+        except ValueError as exc:
+            self.status = f"error: {exc}"
 
     def _update_status(self, stdscr) -> None:
-        from lex.cli import cmd_task_update_status
+        from lex.services.task_service import update_task_status
 
         if not self.state.tasks:
             self.status = "no task selected"
@@ -605,19 +587,14 @@ class RexTui:
              "review_requested", "handoff_pending", "done", "abandoned"],
             task["status"],
         )
-        cmd_task_update_status(
-            type("Args", (), {
-                "root": str(self.root),
-                "task_id": task["id"],
-                "agent": agent,
-                "status": status,
-                "force_role_override": False,
-            })()
-        )
-        self.status = f"✔ task {task['id']} → {status}"
+        try:
+            update_task_status(self._open_conn(), task_id=task["id"], agent=agent, status=status)
+            self.status = f"✔ task {task['id']} → {status}"
+        except ValueError as exc:
+            self.status = f"error: {exc}"
 
     def _delegate_task(self, stdscr) -> None:
-        from lex.cli import cmd_task_delegate
+        from lex.services.task_service import delegate_task
 
         if not self.state.tasks:
             self.status = "no task selected"
@@ -630,27 +607,18 @@ class RexTui:
         if not owner or not assignee or not title or not body:
             self.status = "delegate cancelled"
             return
-        cmd_task_delegate(
-            type("Args", (), {
-                "root": str(self.root),
-                "parent_task_id": task["id"],
-                "owner_agent": owner,
-                "assignee_agent": assignee,
-                "title": title,
-                "slug": None,
-                "description": "",
-                "subject": None,
-                "body": body,
-                "priority": None,
-                "ttl_minutes": 30,
-                "path": [],
-                "force_role_override": False,
-            })()
-        )
-        self.status = f"✔ delegated child task from #{task['id']} to {assignee}"
+        try:
+            result = delegate_task(
+                self._open_conn(),
+                parent_task_id=task["id"], owner_agent=owner,
+                assignee_agent=assignee, title=title, body=body,
+            )
+            self.status = f"✔ delegated child task {result.child_task_id} from #{task['id']} to {assignee}"
+        except ValueError as exc:
+            self.status = f"error: {exc}"
 
     def _handoff_task(self, stdscr) -> None:
-        from lex.cli import cmd_task_handoff
+        from lex.services.task_service import handoff_task
 
         if not self.state.tasks:
             self.status = "no task selected"
@@ -662,18 +630,14 @@ class RexTui:
         if not from_agent or not to_agent or not body:
             self.status = "handoff cancelled"
             return
-        cmd_task_handoff(
-            type("Args", (), {
-                "root": str(self.root),
-                "task_id": task["id"],
-                "from_agent": from_agent,
-                "to_agent": to_agent,
-                "subject": None,
-                "body": body,
-                "force_role_override": False,
-            })()
-        )
-        self.status = f"✔ handed off task #{task['id']} to {to_agent}"
+        try:
+            handoff_task(
+                self._open_conn(),
+                task_id=task["id"], from_agent=from_agent, to_agent=to_agent, body=body,
+            )
+            self.status = f"✔ handed off task #{task['id']} to {to_agent}"
+        except ValueError as exc:
+            self.status = f"error: {exc}"
 
 
 def run_tui(root: Path) -> None:

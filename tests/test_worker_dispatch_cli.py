@@ -115,6 +115,58 @@ def test_worker_runtime_supervisor_tracks_execution(tmp_path):
     assert (runtime_dir / "stdout.log").exists()
 
 
+def test_worker_runtime_spawn_failure_marks_runtime_failed(tmp_path):
+    _, conn = init_workspace(tmp_path)
+    register_pm_agent(conn)
+    command_json = json.dumps(["definitely-not-a-real-binary"])
+
+    main(
+        [
+            "--root",
+            str(tmp_path),
+            "worker",
+            "register",
+            "codex-bad-command",
+            "codex",
+            "--role",
+            "dev",
+            "--command-json",
+            command_json,
+            "--approval-policy",
+            "always",
+            "--created-by",
+            "codex-pm-dalton",
+        ]
+    )
+    main(
+        [
+            "--root",
+            str(tmp_path),
+            "worker",
+            "request-start",
+            "codex-bad-command",
+            "--requested-by",
+            "codex-pm-dalton",
+            "--reason",
+            "spawn failure test",
+            "--approved-by",
+            "human",
+        ]
+    )
+
+    runtime_id = conn.execute("SELECT id FROM worker_runtimes ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    main(["--root", str(tmp_path), "worker", "start", str(runtime_id)])
+    runtime = wait_for_runtime_status(conn, runtime_id, {"failed"})
+
+    event = conn.execute(
+        "SELECT event_type, payload_json FROM events WHERE event_type = 'worker.runtime_finished' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert runtime["status"] == "failed"
+    assert runtime["ended_at"] is not None
+    assert event["event_type"] == "worker.runtime_finished"
+    assert json.loads(event["payload_json"])["status"] == "failed"
+
+
 def test_dispatch_packet_lifecycle_writes_worker_inbox(tmp_path):
     _, conn = init_workspace(tmp_path)
     register_pm_agent(conn)

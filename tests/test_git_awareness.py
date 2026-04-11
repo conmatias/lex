@@ -95,6 +95,19 @@ def test_capture_git_snapshot_detects_dirty_worktree(tmp_path):
     assert snapshot["git_dirty"] == 1
 
 
+def test_capture_git_snapshot_detects_untracked_file_as_dirty(tmp_path):
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "file.txt").write_text("hello")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True)
+
+    (tmp_path / "untracked.txt").write_text("new")
+    snapshot = capture_git_snapshot(str(tmp_path))
+    assert snapshot["git_dirty"] == 1
+
+
 # --- session start stores git fields ---
 
 def test_session_start_stores_git_fields(tmp_path):
