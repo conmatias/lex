@@ -197,7 +197,15 @@ def start_daemon(root: Path, *, socket_path: Path | None = None, wait_timeout: f
         if daemon_running(socket_path):
             return
         time.sleep(0.05)
-    raise RuntimeError("dx runtime daemon failed to start")
+    hint = ""
+    try:
+        hint = stderr_path.read_text().strip()[-500:]
+    except Exception:
+        pass
+    raise RuntimeError(
+        f"dx runtime daemon failed to start (socket: {socket_path})"
+        + (f"\ndaemon stderr: {hint}" if hint else "")
+    )
 
 
 def stop_daemon(root: Path, *, socket_path: Path | None = None) -> bool:
@@ -231,7 +239,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     root = Path(args.root).resolve()
-    socket_path = Path(args.socket).resolve() if args.socket else default_socket_path(root)
+    socket_path = Path(args.socket) if args.socket else default_socket_path(root)
     if args.command == "serve":
         daemon = DxRuntimeDaemon(root, socket_path)
         daemon.serve_forever()
